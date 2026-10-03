@@ -1,0 +1,16 @@
+{
+  "tasks": [
+    {
+      "spec": {
+        "id": "TASK-001",
+        "description": "Rename UserGoal to Goal",
+        "type": "rename",
+        "difficulty": "easy",
+        "risk": "low",
+        "dependsOn": []
+      },
+      "status": "pending",
+      "attempts": []
+    }
+  ]
+}
