@@ -3,11 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "description": "A small dependency-aware orchestration engine with fake workers",
+  "bin": {
+    "orch": "dist/cli.js"
+  },
+  "files": ["dist", "skills", "README.md"],
   "scripts": {
     "build": "tsc",
     "demo": "tsc && node dist/demo.js",
     "demo:graph": "tsc && node dist/demo.js --graph",
-    "test": "tsc && node --test dist/orchestrator.test.js"
+    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",

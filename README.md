@@ -1,11 +1,28 @@
-# AI orchestrator skeleton
+# Orch: AI orchestrator skeleton
 
 This Node.js and TypeScript project schedules dependent tasks, routes them to a simulated worker, validates the result, and retries or escalates failures. It makes **no AI API calls**.
 
-## Run
+## Try the CLI
 
 ```sh
 npm install
+npm run build
+npm link
+cd /path/to/your-project
+orch init
+orch plan "Rename UserGoal to Goal" --type rename --difficulty easy --risk low
+orch status
+orch run
+orch status
+```
+
+Run these `orch` commands from the project you want to plan. `orch init` creates `.orch/tasks.json` there and preserves existing state. `orch plan` adds **one task**, with defaults of `other`, `moderate`, and `medium`; it does not decompose a goal automatically. Add dependencies with `--after TASK-001,TASK-002`. `orch run` currently uses fake workers and does not edit the project's code. Run `orch help` for all options, including `--project` when operating from another directory.
+
+The Codex skill is packaged in `skills/orch/SKILL.md`. To make `$orch` available across local projects, run `orch skill install`; restart Codex if the skill does not appear. The installer copies the skill to your personal `.agents/skills` directory and refuses to overwrite a changed copy unless you pass `--force`.
+
+## Engine demos and tests
+
+```sh
 npm run demo
 npm run demo:graph
 npm test
@@ -26,3 +43,5 @@ npm test
 - `orchestrator.ts` runs all ready tasks in a batch concurrently, validates them, and updates the graph before scheduling the next batch.
 
 Tasks whose dependency failed remain `blocked` and appear in the run result. Graph state is saved after each completed batch in the single-task demo.
+
+The CLI keeps each project's plan in `.orch/tasks.json`. Review task descriptions before committing that file in another repository. Provider connections, shared history, and adaptive routing are future milestones.
