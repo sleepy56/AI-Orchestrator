@@ -3,6 +3,7 @@ import test from "node:test";
 import { FakeExecutor } from "./executor";
 import { orchestrate } from "./orchestrator";
 import { routeTask } from "./router";
+import { ProviderConfigurationError } from "./providers";
 import { TaskGraph } from "./scheduler";
 import { TaskSpec } from "./types";
 
@@ -79,4 +80,42 @@ test("router raises effort for risk, difficulty, and work type", () => {
 test("scheduler rejects missing dependencies and cycles", () => {
   assert.throws(() => TaskGraph.fromSpecs([task("T1", ["unknown"])]), /unknown dependency/);
   assert.throws(() => TaskGraph.fromSpecs([task("T1", ["T2"]), task("T2", ["T1"])]), /cycle/);
+});
+
+test("live-style executor serializes ready siblings and publishes running states", async () => {
+  const graph = TaskGraph.fromSpecs([task("T1"), task("T2")]);
+  let active = 0;
+  let maximum = 0;
+  const states: string[][] = [];
+  await orchestrate(graph, {
+    parallel: false,
+    async execute(spec, route, attempt) {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return { taskId: spec.id, route, attempt, succeeded: true, output: "Validated completion" };
+    },
+  }, (snapshot) => { states.push(snapshot.tasks.map((record) => record.status)); });
+  assert.equal(maximum, 1);
+  assert.deepEqual(states, [["running", "pending"], ["completed", "pending"], ["completed", "running"], ["completed", "completed"]]);
+});
+
+test("provider configuration errors fail once instead of repeatedly calling a broken provider", async () => {
+  const graph = TaskGraph.fromSpecs([task("T1")]);
+  let calls = 0;
+  await orchestrate(graph, {
+    async execute() { calls += 1; throw new ProviderConfigurationError("model unavailable"); },
+  });
+  assert.equal(calls, 1);
+  assert.equal(graph.get("T1").attempts.length, 1);
+  assert.equal(graph.status("T1"), "failed");
+});
+
+test("a persisted running task is never silently replayed", () => {
+  const graph = new TaskGraph({ tasks: [{ spec: task("T1"), status: "running", attempts: [] }] });
+  assert.equal(graph.status("T1"), "running");
+  assert.deepEqual(graph.ready(), []);
+  graph.retry("T1");
+  assert.equal(graph.status("T1"), "ready");
 });

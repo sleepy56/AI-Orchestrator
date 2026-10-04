@@ -1,6 +1,9 @@
 import { Route, TaskSpec } from "./types";
 
 export function routeTask(task: TaskSpec): Route {
+  if (task.risk === "critical" || task.difficulty === "extreme") {
+    return { worker: "sol", effort: "xhigh", label: "sol-xhigh" };
+  }
   if (task.risk === "high" || task.difficulty === "hard") {
     return { worker: "sol", effort: "high", label: "sol-high" };
   }

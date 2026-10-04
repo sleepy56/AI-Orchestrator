@@ -3,7 +3,10 @@ import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promis
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FakeExecutor } from "./executor";
+import { KnowledgeScope, KnowledgeStore } from "./knowledge";
+import { defaultRegistry, loadRegistry, ModelProfile, ProviderId, saveRegistry, validateProfile } from "./models";
 import { orchestrate } from "./orchestrator";
+import { CodexExecutor } from "./providers";
 import { routeTask } from "./router";
 import { TaskGraph } from "./scheduler";
 import { Difficulty, Risk, TaskSnapshot, TaskSpec, TaskType } from "./types";
@@ -11,25 +14,30 @@ import { Difficulty, Risk, TaskSnapshot, TaskSpec, TaskType } from "./types";
 type Options = Record<string, string | boolean>;
 
 const taskTypes: TaskType[] = ["rename", "refactor", "analysis", "test", "other"];
-const difficulties: Difficulty[] = ["easy", "moderate", "hard"];
-const risks: Risk[] = ["low", "medium", "high"];
+const difficulties: Difficulty[] = ["easy", "moderate", "hard", "extreme"];
+const risks: Risk[] = ["low", "medium", "high", "critical"];
 
 function usage(): string {
   return [
-    "orch — dependency-aware task runner (fake workers only)",
+    "orch — dependency-aware task runner",
     "",
     "Usage:",
     "  orch init [directory]",
     "  orch plan <description> [--type rename|refactor|analysis|test|other]",
-    "       [--difficulty easy|moderate|hard] [--risk low|medium|high]",
+    "       [--difficulty easy|moderate|hard|extreme] [--risk low|medium|high|critical]",
     "       [--after TASK-001,TASK-002] [--project directory]",
     "  orch status [--project directory]",
-    "  orch run [--project directory]",
+    "  orch retry TASK-001 [--project directory]  (after a failed or stopped run)",
+    "  orch run [--project directory] [--executor fake|codex] [--check 'npm test']",
+    "  orch models list|add|enable|disable|weight ... [--project directory]",
+    "  orch knowledge add <note> [--scope project|global] [--project directory]",
+    "  orch knowledge list [--scope project|global] [--project directory]",
+    "  orch history [--project directory]",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
     "Plan creates one task; it does not split a goal into subtasks.",
-    "Run simulates workers and does not edit project code.",
+    "Run defaults to fake workers. Codex runs can edit code and require --check.",
   ].join("\n");
 }
 
@@ -44,7 +52,7 @@ function parseArguments(args: string[], allowed: string[]): { positionals: strin
     }
     const name = token.slice(2);
     if (!allowed.includes(name)) throw new Error(`Unknown option: ${token}`);
-    if (name === "force") {
+    if (name === "force" || name === "enable") {
       options[name] = true;
       continue;
     }
@@ -119,13 +127,24 @@ async function init(args: string[]): Promise<void> {
   await mkdir(dirname(target), { recursive: true });
   try {
     await writeFile(target, '{\n  "tasks": []\n}\n', { encoding: "utf8", flag: "wx" });
+    await writeFile(registryPathFor(project), `${JSON.stringify(defaultRegistry(), null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    await ensureProjectIgnore(project);
     console.log(`Initialized orch in ${project}`);
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+      await ensureProjectIgnore(project);
       console.log(`Already initialized: ${project}`);
       return;
     }
     throw error;
+  }
+}
+
+async function ensureProjectIgnore(project: string): Promise<void> {
+  try {
+    await writeFile(join(project, ".orch", ".gitignore"), "knowledge.jsonl\n*.db*\n", { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error;
   }
 }
 
@@ -169,25 +188,134 @@ async function status(args: string[]): Promise<void> {
   }
 }
 
-async function run(args: string[]): Promise<number> {
+async function retry(args: string[]): Promise<void> {
   const { positionals, options } = parseArguments(args, ["project"]);
+  if (positionals.length !== 1) throw new Error("retry needs one task ID");
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const graph = await loadGraph(project);
+  graph.retry(positionals[0]);
+  await saveSnapshot(project, graph.snapshot());
+  console.log(`${positionals[0]} reset to pending. Inspect any prior changes before running it again.`);
+}
+
+async function run(args: string[]): Promise<number> {
+  const { positionals, options } = parseArguments(args, ["project", "executor", "check"]);
   if (positionals.length) throw new Error("run does not accept positional arguments");
   const project = resolve(option(options, "project") ?? process.cwd());
   const graph = await loadGraph(project);
-  console.log("Running with fake workers; project code will not be changed.");
-  const executor = new FakeExecutor();
-  const result = await orchestrate(graph, executor, (snapshot) => saveSnapshot(project, snapshot));
+  const unfinished = graph.snapshot().tasks.filter((record) => record.status === "running");
+  if (unfinished.length) throw new Error(`Tasks still marked running: ${unfinished.map((record) => record.spec.id).join(", ")}. Inspect changes and use orch retry after the prior process stops.`);
+  const mode = oneOf(option(options, "executor"), ["fake", "codex"] as const, "fake", "executor");
+  if (mode === "codex" && !option(options, "check")?.trim()) {
+    throw new Error("Live Codex runs require --check with a project validation command");
+  }
+  const knowledge = new KnowledgeStore(project);
+  const notes = mode === "codex" ? [
+    ...(await knowledge.list("global")).filter((entry) => entry.kind === "note").slice(-10).map((entry) => `[global] ${entry.text.slice(0, 500)}`),
+    ...(await knowledge.list("project")).filter((entry) => entry.kind === "note").slice(-10).map((entry) => `[project] ${entry.text.slice(0, 500)}`),
+  ] : [];
+  const executor = mode === "fake"
+    ? new FakeExecutor()
+    : new CodexExecutor(project, await loadRegistry(project), option(options, "check") ?? "", notes);
+  console.log(mode === "fake" ? "Running with fake workers; project code will not be changed." : "Running live Codex tasks sequentially. Project files may change.");
+  const recorded = new Map(graph.snapshot().tasks.map((record) => [record.spec.id, record.attempts.length]));
+  const result = await orchestrate(graph, executor, async (snapshot) => {
+    await saveSnapshot(project, snapshot);
+    for (const record of snapshot.tasks) {
+      const start = recorded.get(record.spec.id) ?? 0;
+      for (const attempt of record.attempts.slice(start)) {
+        await knowledge.recordAttempt("project", record.spec, attempt, mode === "fake");
+        if (mode === "codex") await knowledge.recordAttempt("global", record.spec, attempt, false);
+      }
+      recorded.set(record.spec.id, record.attempts.length);
+    }
+  });
   for (const [index, batch] of result.batches.entries()) {
     console.log(`Batch ${index + 1}: ${batch.join(" + ")}`);
   }
-  for (const call of executor.calls) {
-    console.log(`${call.taskId}: fake ${call.route} attempt ${call.attempt}`);
+  if (executor instanceof FakeExecutor) {
+    for (const call of executor.calls) console.log(`${call.taskId}: fake ${call.route} attempt ${call.attempt}`);
   }
   for (const record of result.snapshot.tasks) {
     console.log(`${record.spec.id}: ${record.status}`);
   }
   if (result.blocked.length) console.log(`Blocked: ${result.blocked.join(", ")}`);
   return result.snapshot.tasks.some((record) => record.status === "failed") || result.blocked.length ? 1 : 0;
+}
+
+function registryPathFor(project: string): string {
+  return join(project, ".orch", "models.json");
+}
+
+async function models(args: string[]): Promise<void> {
+  const [action, ...rest] = args;
+  const allowed = action === "add" ? ["project", "provider", "model", "tier", "effort", "weight", "enable"] : ["project"];
+  const { positionals, options } = parseArguments(rest, allowed);
+  const project = resolve(option(options, "project") ?? process.cwd());
+  await loadGraph(project);
+  const registry = await loadRegistry(project);
+  if (action === "list") {
+    if (positionals.length) throw new Error("models list takes no aliases");
+    for (const item of registry.models) console.log(`${item.alias}  ${item.provider}  ${item.model || "unconfigured"}  ${item.tier}  ${item.effort}  ${item.enabled ? "enabled" : "disabled"}  weight=${item.weight}`);
+    return;
+  }
+  if (action === "add") {
+    if (positionals.length !== 1) throw new Error("models add needs one alias");
+    if (registry.models.some((item) => item.alias === positionals[0])) throw new Error(`Model alias already exists: ${positionals[0]}`);
+    const provider = oneOf(option(options, "provider"), ["codex", "claude"] as const, "codex", "provider") as ProviderId;
+    const tier = option(options, "tier");
+    const effort = option(options, "effort");
+    if (!tier || !effort) throw new Error("models add requires --tier and --effort");
+    const item: ModelProfile = {
+      alias: positionals[0], provider, model: option(options, "model") ?? "",
+      tier: tier as ModelProfile["tier"], effort: effort as ModelProfile["effort"],
+      enabled: options.enable === true, weight: Number(option(options, "weight") ?? "1"),
+    };
+    validateProfile(item);
+    registry.models.push(item);
+  } else if (action === "enable" || action === "disable" || action === "weight") {
+    if (positionals.length !== (action === "weight" ? 2 : 1)) throw new Error(`models ${action} needs an alias${action === "weight" ? " and value" : ""}`);
+    const item = registry.models.find((model) => model.alias === positionals[0]);
+    if (!item) throw new Error(`Unknown model alias: ${positionals[0]}`);
+    if (action === "weight") item.weight = Number(positionals[1]);
+    else item.enabled = action === "enable";
+    validateProfile(item);
+  } else {
+    throw new Error("Use orch models list|add|enable|disable|weight");
+  }
+  await saveRegistry(project, registry);
+  console.log("Updated model registry.");
+}
+
+async function knowledge(args: string[]): Promise<void> {
+  const [action, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["scope", "project"]);
+  const project = resolve(option(options, "project") ?? process.cwd());
+  await loadGraph(project);
+  const scope = oneOf(option(options, "scope"), ["project", "global"] as const, "project", "scope") as KnowledgeScope;
+  const store = new KnowledgeStore(project);
+  if (action === "add") {
+    await store.note(scope, positionals.join(" "));
+    console.log(`Saved ${scope} knowledge note.`);
+  } else if (action === "list") {
+    if (positionals.length) throw new Error("knowledge list takes no text");
+    for (const entry of await store.list(scope)) {
+      if (entry.kind === "note") console.log(`${entry.at}  note  ${entry.text}`);
+      else console.log(`${entry.at}  ${entry.taskId}  ${entry.route}  ${entry.passed ? "passed" : "failed"}  ${entry.simulated ? "simulated" : entry.model ?? "live"}`);
+    }
+  } else throw new Error("Use orch knowledge add|list");
+}
+
+async function history(args: string[]): Promise<void> {
+  const { positionals, options } = parseArguments(args, ["project"]);
+  if (positionals.length) throw new Error("history takes no positional arguments");
+  const project = resolve(option(options, "project") ?? process.cwd());
+  await loadGraph(project);
+  const entries = await new KnowledgeStore(project).list("project");
+  for (const entry of entries) {
+    if (entry.kind !== "attempt") continue;
+    console.log(`${entry.at}  ${entry.taskId}  ${entry.route}  ${entry.passed ? "passed" : "failed"}  ${entry.model ?? "fake"}  tokens=${(entry.inputTokens ?? 0) + (entry.outputTokens ?? 0)}`);
+  }
 }
 
 async function installSkill(args: string[]): Promise<void> {
@@ -230,8 +358,20 @@ async function main(args: string[]): Promise<number> {
     case "status":
       await status(rest);
       return 0;
+    case "retry":
+      await retry(rest);
+      return 0;
     case "run":
       return run(rest);
+    case "models":
+      await models(rest);
+      return 0;
+    case "knowledge":
+      await knowledge(rest);
+      return 0;
+    case "history":
+      await history(rest);
+      return 0;
     case "skill":
       if (rest[0] !== "install") throw new Error("Use orch skill install");
       await installSkill(rest.slice(1));

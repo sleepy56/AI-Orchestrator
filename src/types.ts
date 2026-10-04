@@ -1,6 +1,6 @@
 export type TaskType = "rename" | "refactor" | "analysis" | "test" | "other";
-export type Difficulty = "easy" | "moderate" | "hard";
-export type Risk = "low" | "medium" | "high";
+export type Difficulty = "easy" | "moderate" | "hard" | "extreme";
+export type Risk = "low" | "medium" | "high" | "critical";
 
 export interface TaskSpec {
   id: string;
@@ -12,7 +12,7 @@ export interface TaskSpec {
 }
 
 export type Worker = "luna" | "sol";
-export type Effort = "low" | "medium" | "high";
+export type Effort = "low" | "medium" | "high" | "xhigh";
 
 export interface Route {
   worker: Worker;
@@ -27,6 +27,12 @@ export interface ExecutionResult {
   succeeded: boolean;
   output: string;
   error?: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  latencyMs?: number;
+  checkCommand?: string;
+  retryable?: boolean;
 }
 
 export interface ValidationResult {
@@ -38,6 +44,11 @@ export interface AttemptRecord {
   attempt: number;
   route: Route;
   validation: ValidationResult;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  latencyMs?: number;
+  checkCommand?: string;
 }
 
 export type TaskStatus = "pending" | "running" | "completed" | "failed";

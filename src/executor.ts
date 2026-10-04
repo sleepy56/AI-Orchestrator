@@ -1,6 +1,7 @@
 import { ExecutionResult, Route, TaskSpec } from "./types";
 
 export interface Executor {
+  readonly parallel?: boolean;
   execute(task: TaskSpec, route: Route, attempt: number): Promise<ExecutionResult>;
 }
 

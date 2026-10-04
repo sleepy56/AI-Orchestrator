@@ -2,7 +2,7 @@
   "name": "ai-orchestrator",
   "version": "0.1.0",
   "private": true,
-  "description": "A small dependency-aware orchestration engine with fake workers",
+  "description": "A dependency-aware CLI orchestrator with fake workers and opt-in Codex execution",
   "bin": {
     "orch": "dist/cli.js"
   },
@@ -11,7 +11,7 @@
     "build": "tsc",
     "demo": "tsc && node dist/demo.js",
     "demo:graph": "tsc && node dist/demo.js --graph",
-    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js"
+    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js dist/knowledge.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",

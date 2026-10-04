@@ -11,7 +11,7 @@ export class TaskGraph {
       if (!spec.description.trim()) throw new Error(`Task ${spec.id} needs a description`);
       this.records.set(spec.id, {
         spec: { ...spec, dependsOn: [...spec.dependsOn] },
-        status: record.status === "running" ? "pending" : record.status,
+        status: record.status,
         attempts: [...record.attempts],
         ...(record.failureReason ? { failureReason: record.failureReason } : {}),
       });
@@ -82,6 +82,15 @@ export class TaskGraph {
   markRunning(id: string): void {
     if (this.status(id) !== "ready") throw new Error(`Task ${id} is not ready`);
     this.get(id).status = "running";
+  }
+
+  retry(id: string): void {
+    const record = this.get(id);
+    if (record.status !== "running" && record.status !== "failed") {
+      throw new Error(`Task ${id} must be running or failed before retry`);
+    }
+    record.status = "pending";
+    delete record.failureReason;
   }
 
   finish(id: string, attempts: AttemptRecord[], passed: boolean): void {

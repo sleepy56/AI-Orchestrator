@@ -84,3 +84,42 @@ test("CLI installs the packaged Codex skill without overwriting by default", asy
     await rm(project, { recursive: true, force: true });
   }
 });
+
+test("CLI manages models and knowledge while keeping live execution opt-in", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    assert.match(orch(project, "models", "list").stdout, /claude-placeholder.*disabled/);
+    assert.equal(orch(project, "models", "add", "luna-alt", "--model", "custom-luna", "--tier", "luna-low", "--effort", "low", "--weight", "3", "--enable").status, 0);
+    assert.match(orch(project, "models", "list").stdout, /luna-alt.*enabled.*weight=3/);
+    assert.match(orch(project, "models", "enable", "claude-placeholder").stderr, /Claude execution is unavailable/);
+    assert.equal(orch(project, "knowledge", "add", "Use the project test suite").status, 0);
+    assert.match(orch(project, "knowledge", "list").stdout, /Use the project test suite/);
+    assert.equal(orch(project, "plan", "Rename a type", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
+    const refused = orch(project, "run", "--executor", "codex");
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /require --check/);
+    assert.match(orch(project, "status").stdout, /TASK-001  ready/);
+    assert.equal(orch(project, "run").status, 0);
+    assert.match(orch(project, "history").stdout, /TASK-001.*luna-low.*passed.*fake/);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("CLI requires explicit retry after an interrupted run", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    assert.equal(orch(project, "plan", "Create a file").status, 0);
+    const target = join(project, ".orch", "tasks.json");
+    const snapshot = JSON.parse(await readFile(target, "utf8")) as TaskSnapshot;
+    snapshot.tasks[0].status = "running";
+    await writeFile(target, JSON.stringify(snapshot), "utf8");
+    assert.match(orch(project, "run").stderr, /orch retry/);
+    assert.equal(orch(project, "retry", "TASK-001").status, 0);
+    assert.match(orch(project, "status").stdout, /TASK-001  ready/);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
