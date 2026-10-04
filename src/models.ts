@@ -16,12 +16,14 @@ export interface ModelProfile {
 
 export interface ModelRegistry {
   version: 1;
+  policyVersion?: number;
   models: ModelProfile[];
 }
 
 export function defaultRegistry(): ModelRegistry {
   return {
     version: 1,
+    policyVersion: 1,
     models: [
       { alias: "luna-low", provider: "codex", model: "gpt-6-luna", tier: "luna-low", effort: "low", enabled: true, weight: 1 },
       { alias: "sol-medium", provider: "codex", model: "gpt-6-sol", tier: "sol-medium", effort: "medium", enabled: true, weight: 1 },
@@ -48,6 +50,9 @@ export async function loadRegistry(project: string): Promise<ModelRegistry> {
     throw new Error("Invalid .orch/models.json");
   }
   const registry = value as ModelRegistry;
+  if (registry.policyVersion !== undefined && (!Number.isSafeInteger(registry.policyVersion) || registry.policyVersion < 1)) {
+    throw new Error("Invalid model policy version");
+  }
   for (const model of registry.models) validateProfile(model);
   if (new Set(registry.models.map((model) => model.alias)).size !== registry.models.length) {
     throw new Error("Duplicate model alias in .orch/models.json");

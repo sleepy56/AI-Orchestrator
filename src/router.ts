@@ -19,3 +19,12 @@ export function routeTask(task: TaskSpec): Route {
 
   return { worker: "luna", effort: "low", label: "luna-low" };
 }
+
+export function routeReason(task: TaskSpec): string {
+  if (task.risk === "critical" || task.difficulty === "extreme") return "critical risk or extreme difficulty";
+  if (task.risk === "high" || task.difficulty === "hard") return "high risk or hard difficulty";
+  if (task.risk === "medium" || task.difficulty === "moderate" || task.type === "refactor" || task.type === "analysis") {
+    return "medium risk, moderate difficulty, refactor, or analysis";
+  }
+  return "low risk and easy task";
+}

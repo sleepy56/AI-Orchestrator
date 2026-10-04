@@ -1,2 +1,8 @@
 node_modules/
 dist/
+.npm-cache/
+.orch/
+ui/dist/
+ui/test-results/
+ui/playwright-report/
+runs.jsonl

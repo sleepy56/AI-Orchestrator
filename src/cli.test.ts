@@ -123,3 +123,37 @@ test("CLI requires explicit retry after an interrupted run", async () => {
     await rm(project, { recursive: true, force: true });
   }
 });
+
+test("CLI --once advances exactly one task and accepts a bounded timeout", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    assert.equal(orch(project, "plan", "First task").status, 0);
+    assert.equal(orch(project, "plan", "Second task", "--after", "TASK-001").status, 0);
+    assert.equal(orch(project, "plan", "Third task", "--after", "TASK-002").status, 0);
+    const run = orch(project, "run", "--once", "--timeout-seconds", "30");
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /TASK-001: completed/);
+    assert.match(orch(project, "status").stdout, /TASK-002  ready/);
+    assert.match(orch(project, "status").stdout, /TASK-003  blocked/);
+    assert.match(orch(project, "run", "--once", "--timeout-seconds", "0").stderr, /integer from 1 to 3600/);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("CLI doctor rejects an invalid timeout without changing task state", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    assert.equal(orch(project, "plan", "Pending task").status, 0);
+    const target = join(project, ".orch", "tasks.json");
+    const before = await readFile(target, "utf8");
+    const result = orch(project, "doctor", "codex", "--timeout-seconds", "0");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /integer from 1 to 3600/);
+    assert.equal(await readFile(target, "utf8"), before);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});

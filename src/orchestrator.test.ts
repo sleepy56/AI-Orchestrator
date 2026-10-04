@@ -27,6 +27,7 @@ test("single rename routes to Luna and completes after validation", async () => 
   assert.deepEqual(result.batches, [["TASK-001"]]);
   assert.equal(graph.status("TASK-001"), "completed");
   assert.equal(graph.get("TASK-001").attempts[0].validation.passed, true);
+  assert.equal(graph.get("TASK-001").attempts[0].response, "Simulated completion: Rename UserGoal to Goal");
   assert.deepEqual(executor.calls.map((call) => call.route), ["luna-low"]);
 });
 
@@ -118,4 +119,13 @@ test("a persisted running task is never silently replayed", () => {
   assert.deepEqual(graph.ready(), []);
   graph.retry("T1");
   assert.equal(graph.status("T1"), "ready");
+});
+
+test("one-task orchestration stops after the first ready task", async () => {
+  const graph = TaskGraph.fromSpecs([task("T1"), task("T2", ["T1"]), task("T3", ["T2"])]);
+  const first = await orchestrate(graph, new FakeExecutor(), undefined, { maxTasks: 1 });
+  assert.deepEqual(first.batches, [["T1"]]);
+  assert.equal(graph.status("T1"), "completed");
+  assert.equal(graph.status("T2"), "ready");
+  assert.equal(graph.status("T3"), "blocked");
 });

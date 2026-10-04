@@ -44,6 +44,7 @@ export interface AttemptRecord {
   attempt: number;
   route: Route;
   validation: ValidationResult;
+  response?: string;
   model?: string;
   inputTokens?: number;
   outputTokens?: number;
