@@ -69,15 +69,15 @@ The reference image is useful for its hierarchy and dark visual language. The Or
 - Provider availability and model lifecycle: added, disabled, tested, promoted, reverted.
 - Token usage, latency, and price snapshot when reliable pricing data is available. Display “cost unknown” otherwise.
 
-The current `.orch/tasks.json`, `.orch/models.json`, and JSONL knowledge logs are a CLI prototype. Before building timeline replay or multi-process UI access, move operational events and model observations into SQLite with migrations, WAL mode, and indexed tables. Keep small user-editable project settings in JSON. Use one project database at `.orch/orch.db` and a global database under the user's Orch home. Do not store credentials in either database.
+The current release stores task and model state in JSON, knowledge and attempt history in JSONL, and replay events in `.orch/runs.jsonl`. A read-only local API powers Overview, replay, Models, and Learning. Routing still uses fixed task rules and configured model weights. It reads the most recent global and project notes for live prompts, but does not retrieve notes by relevance or learn a routing policy from outcomes.
 
-## Build order
+## Next build order
 
-1. Finish backend event records and independent validation. Add task/run IDs and policy versions.
-2. Move history to SQLite and expose a read-only local API or event stream.
-3. Build Overview and Run detail with a graph library such as React Flow. Keep the CLI as the control surface initially.
-4. Add Models and Learning controls with clear evidence, sample sizes, and one-click rollback.
-5. Add Knowledge editing and project settings. Test keyboard access and dense graph layouts.
+1. **Make knowledge usable across projects.** Give every note a scope, source project, task category, timestamp, and review state. Promote only reusable lessons to global scope; keep repository-specific paths, code, and failures in the project. At the start of a task, retrieve a small number of relevant notes using task type, risk, and text, then record which notes were included and whether the user accepted or rejected them. Provide edit, removal, and export controls.
+2. **Evaluate cheaper routes.** Group live, validated attempts by task category and model. Track first-pass success, retries, escalation, token use, latency, and a versioned price snapshot where pricing is actually applicable. Run a cheaper candidate on selected low-risk tasks, compare its outcome with the current route, and recommend a policy change only after enough comparable evidence. Keep the existing route as a fallback and make policy changes reversible. A passing generic check is insufficient evidence of semantic quality.
+3. **Strengthen local persistence.** Move operational state and event writes into SQLite transactions with migrations and indexed replay queries. Keep small editable settings in JSON. A project database can live at `.orch/orch.db`; a global database can live under the user's Orch home. Import the existing JSONL records without losing simulated/live labels or timestamps.
+4. **Add optional cloud sync for a portfolio app.** Put a server API between the UI/CLI and Neon Postgres. Sync opted-in projects, sanitized run metadata, and global knowledge through authenticated endpoints; keep provider credentials and private repository content local. Use separate Neon branches for development and production and keep its connection string in server-side configuration.
+5. **Complete the UI workflow.** Add a project switcher, a Knowledge screen that shows why each note was retrieved, and Learning recommendations with sample sizes, estimated tradeoffs, approval, and rollback. Let the user inspect and export a run before enabling remote sync.
 
 TypeScript fits the CLI, local service, and React interface in one language. Rust may be useful later for a constrained native service or unusually heavy graph computation; the current bottlenecks are model latency, validation quality, and state design rather than TypeScript execution speed.
 
