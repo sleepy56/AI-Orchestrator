@@ -4,16 +4,67 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { KnowledgeStore } from "./knowledge";
+import { routeTask } from "./router";
 import { TaskSnapshot } from "./types";
 
 const cliPath = join(__dirname, "cli.js");
+
+test("CLI shows candidate evidence and approval creates one reviewed lesson", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-candidate-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    const store = new KnowledgeStore(project, join(project, "global"));
+    const task = { id: "TASK-001", description: "Rename a type", type: "rename" as const, difficulty: "easy" as const, risk: "low" as const, dependsOn: [] };
+    await store.recordAttempt("project", task, { attempt: 1, route: routeTask(task), validation: { passed: true, errors: [] } }, false, "live-run-1");
+    const candidate = (await store.list("project")).find((entry) => entry.kind === "candidate");
+    assert.ok(candidate);
+    const listed = orch(project, "knowledge", "list");
+    assert.match(listed.stdout, new RegExp(`${candidate.id}.*pending.*candidate.*live-run-1`));
+    assert.equal(orch(project, "knowledge", "review", candidate.id, "--status", "approved").status, 0);
+    const entries = await store.list("project");
+    assert.equal(entries.filter((entry) => entry.kind === "note" && entry.reviewStatus === "approved").length, 1);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
 
 function orch(project: string, ...args: string[]) {
   return spawnSync(process.execPath, [cliPath, ...args], {
     cwd: project,
     encoding: "utf8",
+    env: { ...process.env, ORCH_HOME: join(project, "global") },
   });
 }
+
+test("CLI knowledge review and promotion keep private details local with an audit trail", async () => {
+  const project = await mkdtemp(join(tmpdir(), "orch-cli-review-"));
+  try {
+    assert.equal(orch(project, "init").status, 0);
+    assert.notEqual(orch(project, "knowledge", "add", "Direct global note", "--scope", "global").status, 0);
+    assert.equal(orch(project, "knowledge", "add", "Run C:/repo/private/check.ps1", "--type", "test").status, 0);
+    const id = orch(project, "knowledge", "list").stdout.match(/[0-9a-f-]{36}/)?.[0];
+    assert.ok(id);
+    assert.notEqual(orch(project, "knowledge", "promote", id).status, 0);
+    assert.equal(orch(project, "knowledge", "review", id, "--status", "approved").status, 0);
+    assert.notEqual(orch(project, "knowledge", "promote", id).status, 0);
+    assert.equal(orch(project, "knowledge", "edit", id, "For tests, verify public behavior").status, 0);
+    assert.notEqual(orch(project, "knowledge", "promote", id).status, 0);
+    assert.equal(orch(project, "knowledge", "review", id, "--status", "approved").status, 0);
+    assert.equal(orch(project, "knowledge", "promote", id).status, 0);
+    const global = orch(project, "knowledge", "export", "--scope", "global");
+    assert.equal(global.status, 0);
+    const exported = JSON.parse(global.stdout);
+    assert.equal(exported.entries[0].sourceEntryId, id);
+    assert.doesNotMatch(global.stdout, /check\.ps1|C:\/repo/);
+    assert.equal(orch(project, "knowledge", "remove", exported.entries[0].id, "--scope", "global").status, 0);
+    const after = JSON.parse(orch(project, "knowledge", "export", "--scope", "global").stdout);
+    assert.deepEqual(after.entries, []);
+    assert.deepEqual(after.audit.map((event: { action: string }) => event.action), ["promote", "remove"]);
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
 
 test("CLI initializes, plans a graph, runs fake workers, and reports status", async () => {
   const project = await mkdtemp(join(tmpdir(), "orch-cli-"));
@@ -90,11 +141,17 @@ test("CLI manages models and knowledge while keeping live execution opt-in", asy
   try {
     assert.equal(orch(project, "init").status, 0);
     assert.match(orch(project, "models", "list").stdout, /claude-placeholder.*disabled/);
+    const listed = orch(project, "models", "list").stdout;
+    for (const effort of ["low", "medium", "high"]) {
+      assert.match(listed, new RegExp(`luna-${effort}  codex  gpt-6-luna  luna-${effort}  ${effort}  enabled`));
+    }
     assert.equal(orch(project, "models", "add", "luna-alt", "--model", "custom-luna", "--tier", "luna-low", "--effort", "low", "--weight", "3", "--enable").status, 0);
     assert.match(orch(project, "models", "list").stdout, /luna-alt.*enabled.*weight=3/);
     assert.match(orch(project, "models", "enable", "claude-placeholder").stderr, /Claude execution is unavailable/);
-    assert.equal(orch(project, "knowledge", "add", "Use the project test suite").status, 0);
+    assert.equal(orch(project, "knowledge", "add", "Use the project test suite", "--type", "test").status, 0);
     assert.match(orch(project, "knowledge", "list").stdout, /Use the project test suite/);
+    const knowledge = JSON.parse(await readFile(join(project, ".orch", "knowledge.v1.json"), "utf8"));
+    assert.equal(knowledge.entries[0].taskCategory, "test");
     assert.equal(orch(project, "plan", "Rename a type", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
     const refused = orch(project, "run", "--executor", "codex");
     assert.equal(refused.status, 1);

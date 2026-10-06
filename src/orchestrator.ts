@@ -11,6 +11,7 @@ export interface RunResult {
   batches: string[][];
   snapshot: TaskSnapshot;
   blocked: string[];
+  paused?: string;
 }
 
 export interface RunOptions {
@@ -18,6 +19,7 @@ export interface RunOptions {
   onEvent?: (event: RunEventData) => Promise<void> | void;
   simulated?: boolean;
   routeDecision?: (task: TaskSpec, route: Route, attempt: number) => RunEventData;
+  beforeTask?: () => Promise<string | undefined> | string | undefined;
 }
 
 export async function orchestrate(
@@ -28,17 +30,20 @@ export async function orchestrate(
 ): Promise<RunResult> {
   const batches: string[][] = [];
   let executed = 0;
+  let paused: string | undefined;
   if (options.maxTasks !== undefined && (!Number.isInteger(options.maxTasks) || options.maxTasks < 1)) {
     throw new Error("maxTasks must be a positive integer");
   }
 
-  while (executed < (options.maxTasks ?? Number.POSITIVE_INFINITY)) {
+  outer: while (executed < (options.maxTasks ?? Number.POSITIVE_INFINITY)) {
     const ready = graph.ready().slice(0, (options.maxTasks ?? Number.POSITIVE_INFINITY) - executed);
     if (ready.length === 0) break;
-    batches.push(ready.map((task) => task.id));
     if (executor.parallel === false) {
       // Live agents share a working tree; publish each transition for status readers.
       for (const task of ready) {
+        paused = await options.beforeTask?.();
+        if (paused) break outer;
+        batches.push([task.id]);
         graph.markRunning(task.id);
         await options.onEvent?.({ type: "task.started", taskId: task.id });
         await onUpdate?.(graph.snapshot());
@@ -49,6 +54,9 @@ export async function orchestrate(
         executed += 1;
       }
     } else {
+      paused = await options.beforeTask?.();
+      if (paused) break;
+      batches.push(ready.map((task) => task.id));
       for (const task of ready) {
         graph.markRunning(task.id);
         await options.onEvent?.({ type: "task.started", taskId: task.id });
@@ -68,6 +76,7 @@ export async function orchestrate(
     batches,
     snapshot: graph.snapshot(),
     blocked: graph.blocked().map((task) => task.id),
+    ...(paused ? { paused } : {}),
   };
 }
 
@@ -109,6 +118,11 @@ async function runTask(
       ...(execution?.outputTokens !== undefined ? { outputTokens: execution.outputTokens } : {}),
       ...(execution?.latencyMs !== undefined ? { latencyMs: execution.latencyMs } : {}),
       ...(execution?.checkCommand ? { checkCommand: execution.checkCommand } : {}),
+      ...(execution?.checkOutput !== undefined ? { checkOutput: execution.checkOutput } : {}),
+      ...(execution?.checkExitCode !== undefined ? { checkExitCode: execution.checkExitCode } : {}),
+      ...(execution?.contextId ? { contextId: execution.contextId } : {}),
+      ...(execution?.worktree ? { worktree: execution.worktree } : {}),
+      ...(execution?.commit ? { commit: execution.commit } : {}),
     });
     await onEvent?.({ type: "attempt.finished", taskId: task.id, attempt: attempts[attempts.length - 1], simulated });
     if (validation.passed) return { id: task.id, attempts, passed: true };

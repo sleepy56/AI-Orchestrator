@@ -1,9 +1,12 @@
 import { StrictMode, useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { loadOverview, type OverviewData, type RunEvent, type Task, type TaskStatus } from "./api";
+import { loadOverview, loadProject, type OverviewData, type ProjectData, type RunEvent, type Task, type TaskStatus } from "./api";
+import { ProjectRegistration } from "./project-registration";
+import { PlanningView } from "./planning-view";
 import { TaskGraph } from "./task-graph";
 import { WorkerMap } from "./worker-map";
 import { LearningView, ModelsView } from "./models-learning";
+import { KnowledgeView } from "./knowledge-view";
 import { replayRun } from "./replay";
 import "./styles.css";
 
@@ -20,6 +23,8 @@ function taskName(event: RunEvent, tasks: Task[]): string {
 function eventLabel(event: RunEvent): string {
   switch (event.type) {
     case "run.started": return "Run started";
+    case "run.resumed": return "Run resumed";
+    case "run.paused": return "Run paused for approval";
     case "run.finished": return "Run finished";
     case "task.started": return "Task started";
     case "task.finished": return `Task ${event.status ?? "finished"}`;
@@ -31,8 +36,9 @@ function eventLabel(event: RunEvent): string {
 }
 
 function App() {
-  const [view, setView] = useState<"overview" | "models" | "learning">(() => viewFromHash());
+  const [view, setView] = useState<"overview" | "models" | "learning" | "knowledge" | "project" | "planning">(() => viewFromHash());
   const [data, setData] = useState<OverviewData>();
+  const [projectData, setProjectData] = useState<ProjectData>();
   const [error, setError] = useState<string>();
   const [refreshing, setRefreshing] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date>();
@@ -43,6 +49,10 @@ function App() {
   const refresh = useCallback(async (signal: AbortSignal) => {
     setRefreshing(true);
     try {
+      const project = await loadProject(signal);
+      if (signal.aborted) return;
+      setProjectData(project);
+      if (!project.registered) { setView("project"); setError(undefined); return; }
       const next = await loadOverview(signal, selectedRunId);
       if (signal.aborted) return;
       setData(next);
@@ -109,27 +119,34 @@ function App() {
           <a className={`nav-item ${view === "overview" ? "active" : ""}`} href="#overview" aria-current={view === "overview" ? "page" : undefined}><span aria-hidden="true">▦</span> Overview</a>
           <a className={`nav-item ${view === "models" ? "active" : ""}`} href="#models" aria-current={view === "models" ? "page" : undefined}><span aria-hidden="true">◈</span> Models</a>
           <a className={`nav-item ${view === "learning" ? "active" : ""}`} href="#learning" aria-current={view === "learning" ? "page" : undefined}><span aria-hidden="true">↗</span> Learning</a>
+          <a className={`nav-item ${view === "knowledge" ? "active" : ""}`} href="#knowledge" aria-current={view === "knowledge" ? "page" : undefined}><span aria-hidden="true">◇</span> Knowledge</a>
+          <a className={`nav-item ${view === "project" ? "active" : ""}`} href="#project" aria-current={view === "project" ? "page" : undefined}><span aria-hidden="true">⌂</span> Project</a>
+          <a className={`nav-item ${view === "planning" ? "active" : ""}`} href="#planning" aria-current={view === "planning" ? "page" : undefined}><span aria-hidden="true">◇</span> Planning</a>
         </nav>
         <div className="sidebar-bottom"><span className="connection-dot" aria-hidden="true" /> Local project <span className="sidebar-version">v0.1</span></div>
       </aside>
 
       <main id="main-content" className="main-content" tabIndex={-1}>
         <header className="topbar">
-          <div className="breadcrumb">Workspace <span>/</span> <strong>{view === "overview" ? "Overview" : view === "models" ? "Models" : "Learning"}</strong></div>
-          <div className="topbar-actions"><span className="read-only">READ ONLY</span><button type="button" onClick={() => void refresh(new AbortController().signal)} disabled={refreshing}>↻ <span>Refresh</span></button></div>
+          <div className="breadcrumb">Workspace <span>/</span> <strong>{view === "overview" ? "Overview" : view === "models" ? "Models" : view === "project" ? "Project" : "Learning"}</strong></div>
+          <div className="topbar-actions"><button type="button" onClick={() => void refresh(new AbortController().signal)} disabled={refreshing}>↻ <span>Refresh</span></button></div>
         </header>
 
         <div className="content">
           {error && <div className="error-banner" role="alert"><strong>Could not load the local API.</strong> {error}. Start it with <code>npm run build</code> and <code>node dist/cli.js serve --port 8765</code>.</div>}
-          {!data && !error && <div className="loading" role="status">Loading project state…</div>}
+          {!projectData && !error && <div className="loading" role="status">Loading project state…</div>}
+
+          {projectData && view === "project" && <ProjectRegistration data={projectData} onRegistered={() => void refresh(new AbortController().signal)} />}
+          {projectData?.registered && view === "planning" && <PlanningView />}
 
           {data && view === "models" && <ModelsView models={data.models} attempts={data.attempts} policyVersion={data.policyVersion} />}
           {data && view === "learning" && <LearningView models={data.models} attempts={data.attempts} policyVersion={data.policyVersion} />}
+          {data && view === "knowledge" && <KnowledgeView knowledge={data.knowledge} proposals={data.proposals} tasks={data.tasks} />}
           {data && view === "overview" && <>
             <div className="page-intro"><div><div className="eyebrow">PROJECT CONTROL CENTER</div><h1>Overview</h1><p>Live task state and validation evidence from your local Orch API.</p></div><div className="update-time" aria-live="polite">{updatedAt ? `Updated ${updatedAt.toLocaleTimeString()}` : "Connecting to local API"}</div></div>
             <section className="run-banner" aria-labelledby="run-heading">
               <div className="run-symbol" aria-hidden="true">◎</div>
-              <div className="run-copy"><div className="overline">SELECTED RUN</div><h2 id="run-heading">{run ? run.status === "running" ? "Run in progress" : "Run finished" : "No runs yet"}</h2><p>{run ? `Started ${shortDate(run.startedAt)} · ${run.runId.slice(0, 8)}` : "Plan tasks and start a run from the CLI to see activity here."}</p></div>
+              <div className="run-copy"><div className="overline">SELECTED RUN</div><h2 id="run-heading">{run ? run.status === "running" ? "Run in progress" : run.status === "paused" ? "Run paused for approval" : "Run finished" : "No runs yet"}</h2><p>{run ? `Started ${shortDate(run.startedAt)} · ${run.runId.slice(0, 8)}` : "Plan tasks and start a run from the CLI to see activity here."}</p></div>
               {run && <span className={`mode-badge ${run.mode}`}>{run.mode === "simulated" ? "◇ Simulated run" : "● Live run"}</span>}
             </section>
 
@@ -176,8 +193,8 @@ function App() {
   );
 }
 
-function viewFromHash(): "overview" | "models" | "learning" {
-  return window.location.hash === "#models" ? "models" : window.location.hash === "#learning" ? "learning" : "overview";
+function viewFromHash(): "overview" | "models" | "learning" | "knowledge" | "project" | "planning" {
+  return window.location.hash === "#models" ? "models" : window.location.hash === "#learning" ? "learning" : window.location.hash === "#knowledge" ? "knowledge" : window.location.hash === "#project" ? "project" : window.location.hash === "#planning" ? "planning" : "overview";
 }
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

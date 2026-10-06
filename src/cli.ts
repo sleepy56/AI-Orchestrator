@@ -1,17 +1,23 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FakeExecutor } from "./executor";
-import { KnowledgeScope, KnowledgeStore } from "./knowledge";
+import { KnowledgeScope, KnowledgeStore, SelectedLesson } from "./knowledge";
 import { createLocalApi } from "./local-api";
-import { defaultRegistry, loadRegistry, ModelProfile, ProviderId, saveRegistry, selectModel, validateProfile } from "./models";
+import { actionGate, Command, CommandService, executionGate, worktreeBaseGate } from "./command-service";
+import { checkReport, runBaseline, runCheck } from "./checks";
+import { PlanningWorkflow } from "./planning";
+import { PriceSnapshot, recommendModelRoute } from "./model-decisions";
+import { loadRegistry, ModelProfile, ProviderId, selectModel, validateProfile } from "./models";
 import { orchestrate } from "./orchestrator";
-import { CodexExecutor, smokeCodex } from "./providers";
+import { smokeCodex } from "./providers";
 import { routeReason, routeTask } from "./router";
-import { RunEventWriter } from "./run-events";
+import { readRunEvents, RunEventWriter } from "./run-events";
 import { TaskGraph } from "./scheduler";
-import { Difficulty, Risk, TaskSnapshot, TaskSpec, TaskType } from "./types";
+import { Difficulty, Risk, TaskSnapshot, TaskType } from "./types";
+import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
 
 type Options = Record<string, string | boolean>;
 
@@ -24,19 +30,44 @@ function usage(): string {
     "orch — dependency-aware task runner",
     "",
     "Usage:",
-    "  orch init [directory]",
+    "  orch init [directory] [--docs README.md,docs/architecture.md]",
     "  orch plan <description> [--type rename|refactor|analysis|test|other]",
     "       [--difficulty easy|moderate|hard|extreme] [--risk low|medium|high|critical]",
     "       [--after TASK-001,TASK-002] [--project directory]",
+    "  orch draft start <goal> [--project directory]",
+    "  orch draft show [--project directory]",
+    "  orch draft answer --file answers.json [--project directory]",
+    "  orch draft edit --file tasks.json [--project directory]",
+    "  orch draft approve [--project directory]",
+    "  orch checks approve [--project directory]",
+    "  orch checks baseline|list [TASK-001] [--project directory]",
+    "  orch checks history <check-id> [--project directory]",
+    "  orch checks add TASK-001 --command 'npm test' --phase task --timeout-seconds 600 --expected 'exit 0' [--cwd .] [--criterion text] [--project directory]",
+    "  orch checks run <check-id>|task TASK-001 [--project directory]",
+    "  orch checks skip <check-id> --reason text [--project directory]",
+    "  orch checks review <check-id> --reviewer name [--project directory]",
     "  orch status [--project directory]",
     "  orch retry TASK-001 [--project directory]  (after a failed or stopped run)",
-    "  orch run [--once] [--project directory] [--executor fake|codex] [--check 'npm test'] [--timeout-seconds 600]",
+    "  orch run [--once] [--resume RUN-ID] [--project directory] [--executor fake|codex] [--check 'npm test'] [--timeout-seconds 600]",
+    "  orch worktrees base <branch> <commit> [--project directory]",
+    "  orch worktrees show [--project directory]",
+    "  orch worktrees integrate TASK-001,TASK-002 --check 'npm test' [--project directory]",
+    "  orch worktrees merge <approved-action-id> [--project directory]",
+    "  orch actions request merge|deployment <destination> <artifact-revision> [--base-revision TARGET-HEAD] [--id ACTION-ID] [--project directory]",
+    "  orch actions show|approve|ready <action-id> [--project directory]",
     "  orch doctor codex [--project directory] [--timeout-seconds 60]",
     "  orch models list|add|enable|disable|weight ... [--project directory]",
-    "  orch knowledge add <note> [--scope project|global] [--project directory]",
+    "  orch models recommend TASK-001 --prices snapshot.json [--manual-alias alias] [--project directory]",
+    "  orch knowledge add <note> [--type rename|refactor|analysis|test|other] [--project directory]",
     "  orch knowledge list [--scope project|global] [--project directory]",
+    "  orch knowledge review <id> --status pending|approved|rejected [--project directory]  (approving a candidate creates a reviewed lesson)",
+    "  orch knowledge promote <id> [--project directory]",
+    "  orch knowledge edit <id> <new text> [--project directory]",
+    "  orch knowledge remove <id> [--scope project|global] [--project directory]",
+    "  orch knowledge export [--scope project|global] [--output file] [--project directory]",
     "  orch history [--project directory]",
-    "  orch serve [--project directory] [--port 8765]  (read-only local API)",
+    "  orch serve [--project directory] [--port 8765]  (local API)",
+    "  orch command --json '{...}' [--project directory]  (versioned local command)",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
@@ -113,45 +144,30 @@ async function saveSnapshot(project: string, snapshot: TaskSnapshot): Promise<vo
   }
 }
 
-function nextId(snapshot: TaskSnapshot): string {
-  const existing = new Set(snapshot.tasks.map((record) => record.spec.id));
-  let number = Math.max(0, ...snapshot.tasks.map((record) => {
-    const match = /^TASK-(\d+)$/.exec(record.spec.id);
-    return match ? Number(match[1]) : 0;
-  })) + 1;
-  while (existing.has(`TASK-${String(number).padStart(3, "0")}`)) number += 1;
-  return `TASK-${String(number).padStart(3, "0")}`;
-}
-
 async function init(args: string[]): Promise<void> {
-  const { positionals } = parseArguments(args, []);
+  const { positionals, options } = parseArguments(args, ["docs"]);
   if (positionals.length > 1) throw new Error("init accepts at most one directory");
   const project = resolve(positionals[0] ?? process.cwd());
-  const target = statePath(project);
-  await mkdir(dirname(target), { recursive: true });
-  try {
-    await writeFile(target, '{\n  "tasks": []\n}\n', { encoding: "utf8", flag: "wx" });
-    await writeFile(registryPathFor(project), `${JSON.stringify(defaultRegistry(), null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-    await ensureProjectIgnore(project);
-    console.log(`Initialized orch in ${project}`);
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
-      await ensureProjectIgnore(project);
-      console.log(`Already initialized: ${project}`);
-      return;
-    }
-    throw error;
-  }
+  await mkdir(project, { recursive: true });
+  const existed = await readFile(statePath(project), "utf8").then(() => true, (error: unknown) => { if (isMissing(error)) return false; throw error; });
+  const docs = option(options, "docs");
+  const registered = await new CommandService(project).register(docs === undefined ? undefined : docs.split(",").map((item) => item.trim()));
+  await ensureProjectIgnore(project);
+  console.log(`${existed ? "Already initialized" : "Initialized orch in"}: ${project}`);
+  console.log(`Project ID: ${registered.id}; context version: ${registered.context?.version}`);
 }
 
 async function ensureProjectIgnore(project: string): Promise<void> {
   try {
-    await writeFile(join(project, ".orch", ".gitignore"), "knowledge.jsonl\nruns.jsonl\n*.db*\n", { encoding: "utf8", flag: "wx" });
+    await writeFile(join(project, ".orch", ".gitignore"), "knowledge.jsonl\nknowledge.v*.json\nknowledge.v*.json.lock\nruns.jsonl\ncommands.v*.json\ncommands.v*.json.lock\nworktrees.json\nworktrees/\n*.db*\n", { encoding: "utf8", flag: "wx" });
   } catch (error) {
     if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error;
     const target = join(project, ".orch", ".gitignore");
-    if (!(await readFile(target, "utf8")).split(/\r?\n/).includes("runs.jsonl")) {
-      await appendFile(target, "runs.jsonl\n", "utf8");
+    const content = await readFile(target, "utf8");
+    const lines = new Set(content.split(/\r?\n/));
+    if (content && !content.endsWith("\n")) await appendFile(target, "\n", "utf8");
+    for (const pattern of ["runs.jsonl", "knowledge.v*.json", "knowledge.v*.json.lock", "commands.v*.json", "commands.v*.json.lock", "worktrees.json", "worktrees/"]) {
+      if (!lines.has(pattern)) await appendFile(target, `${pattern}\n`, "utf8");
     }
   }
 }
@@ -161,25 +177,178 @@ async function plan(args: string[]): Promise<void> {
   const description = positionals.join(" ").trim();
   if (!description) throw new Error("plan needs a task description");
   const project = resolve(option(options, "project") ?? process.cwd());
-  const graph = await loadGraph(project);
-  const snapshot = graph.snapshot();
   const dependsOn = option(options, "after")?.split(",").map((id) => id.trim()) ?? [];
   if (dependsOn.some((id) => !id) || new Set(dependsOn).size !== dependsOn.length) {
     throw new Error("--after needs unique, nonempty task IDs");
   }
-  const spec: TaskSpec = {
-    id: nextId(snapshot),
+  const spec = {
     description,
     type: oneOf(option(options, "type"), taskTypes, "other", "type"),
     difficulty: oneOf(option(options, "difficulty"), difficulties, "moderate", "difficulty"),
     risk: oneOf(option(options, "risk"), risks, "medium", "risk"),
     dependsOn,
   };
-  snapshot.tasks.push({ spec, status: "pending", attempts: [] });
-  new TaskGraph(snapshot); // Validate dependencies and cycles before writing.
-  await saveSnapshot(project, snapshot);
-  console.log(`Added ${spec.id}: ${spec.description}`);
-  console.log(`Route: ${routeTask(spec).label}; dependencies: ${dependsOn.join(", ") || "none"}`);
+  const service = new CommandService(project);
+  const result = await service.execute({ version: 1, kind: "plan.add", expectedRevision: await service.revision(), payload: spec });
+  console.log(`Added ${result.subjectId}: ${spec.description}`);
+  console.log(`Route: ${routeTask({ ...spec, id: result.subjectId }).label}; dependencies: ${dependsOn.join(", ") || "none"}`);
+}
+
+async function draft(args: string[]): Promise<void> {
+  const [action, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project", "file"]);
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const service = new CommandService(project);
+  if (action === "start") {
+    if (!positionals.length || option(options, "file")) throw new Error("draft start needs a goal");
+    await new PlanningWorkflow(project).start(positionals.join(" "));
+  } else if (action === "answer") {
+    if (positionals.length || !option(options, "file")) throw new Error("draft answer needs --file answers.json");
+    const answers = JSON.parse(await readFile(resolve(option(options, "file")!), "utf8")) as Record<string, string>;
+    await new PlanningWorkflow(project).answer(answers, await service.revision());
+  } else if (action === "edit") {
+    if (positionals.length || !option(options, "file")) throw new Error("draft edit needs --file tasks.json");
+    const tasks = JSON.parse(await readFile(resolve(option(options, "file")!), "utf8")) as unknown;
+    await service.execute({ version: 1, kind: "plan.draft", expectedRevision: await service.revision(), payload: { tasks } });
+  } else if (action === "approve") {
+    if (positionals.length || option(options, "file")) throw new Error("draft approve takes no additional arguments");
+    const state = await service.detail();
+    if (state.plan.value.draft?.status !== "review") throw new Error("No draft awaits review");
+    await service.execute({ version: 1, kind: "approval.grant", expectedRevision: state.revision,
+      payload: { target: "plan", targetRevision: state.plan.revision, actor: "user" } });
+  } else if (action !== "show" || positionals.length || option(options, "file")) throw new Error("Use orch draft start|show|answer|edit|approve");
+  const state = await service.detail();
+  console.log(JSON.stringify({ revision: state.revision, planRevision: state.plan.revision, draft: state.plan.value.draft ?? null,
+    approved: Object.values(state.approvals).some((record) => record.value.target === "plan" && record.value.targetRevision === state.plan.revision) }, null, 2));
+}
+
+async function checks(args: string[]): Promise<number> {
+  const [action, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project", "command", "procedure", "phase", "timeout-seconds", "expected", "cwd", "criterion", "reason", "reviewer", "id"]);
+  const service = new CommandService(resolve(option(options, "project") ?? process.cwd()));
+  if (action === "approve") {
+    if (positionals.length) throw new Error("checks approve takes no check ID");
+    const state = await service.detail();
+    const result = await service.execute({ version: 1, kind: "approval.grant", expectedRevision: state.revision,
+      payload: { target: "checks", targetRevision: state.checksRevision, actor: "user" } });
+    console.log(`Checks revision ${state.checksRevision} approved (${result.subjectId})`);
+    return 0;
+  }
+  if (action === "baseline") {
+    if (positionals.length) throw new Error("checks baseline takes no task ID");
+    const report = await runBaseline(service);
+    printChecks(report);
+    return 0; // Starting health is evidence, not a task regression.
+  }
+  if (action === "list") {
+    if (positionals.length > 1) throw new Error("checks list takes at most one task ID");
+    printChecks(await checkReport(service, positionals[0]));
+    return 0;
+  }
+  if (action === "history") {
+    if (positionals.length !== 1) throw new Error("checks history needs one check ID");
+    const state = await service.detail();
+    const check = state.checks[positionals[0]];
+    if (!check) throw new Error(`Unknown check: ${positionals[0]}`);
+    console.log(JSON.stringify({ id: positionals[0], history: check.history ?? [{ revision: check.revision, value: check.value }], results: check.results ?? [] }, null, 2));
+    return 0;
+  }
+  if (action === "add") {
+    if (positionals.length !== 1 || !option(options, "command") && !option(options, "procedure")) throw new Error("checks add needs a task ID and --command or --procedure");
+    const timeoutSeconds = Number(option(options, "timeout-seconds") ?? "600");
+    const result = await service.execute({ version: 1, kind: "check.put", expectedRevision: await service.revision(), payload: {
+      ...(option(options, "id") ? { id: option(options, "id") } : {}), taskId: positionals[0],
+      ...(option(options, "command") ? { command: option(options, "command") } : { procedure: option(options, "procedure") }),
+      phase: option(options, "phase") ?? (option(options, "procedure") ? "review" : "task"),
+      cwd: option(options, "cwd") ?? ".", timeoutSeconds, expected: option(options, "expected") ?? "exit 0",
+      ...(option(options, "criterion") ? { criterion: option(options, "criterion") } : {}),
+    } });
+    console.log(`Check ${result.subjectId} saved at revision ${result.revision}`);
+    return 0;
+  }
+  if (action === "run") {
+    if (positionals.length !== 1 && !(positionals.length === 2 && positionals[0] === "task")) throw new Error("checks run needs a check ID or task TASK-001");
+    const state = await service.detail();
+    const ids = positionals[0] === "task" ? Object.entries(state.checks).filter(([, check]) => check.value.taskId === positionals[1] && check.value.command && (check.value.planRevision === undefined || check.value.planRevision === state.plan.revision)).map(([id]) => id) : [positionals[0]];
+    const outcomes = [];
+    for (const id of ids) { const result = await runCheck(service, id); outcomes.push(result.status); console.log(`${id}: ${result.status}${result.reason ? ` (${result.reason})` : ""}`); }
+    const report = await checkReport(service, positionals[0] === "task" ? positionals[1] : undefined);
+    printChecks(report);
+    return outcomes.some((status) => status === "fail" || status === "missing") || positionals[0] === "task" && report.rows.some((row) => row.taskId === positionals[1] && row.status === "missing") ? 1 : 0;
+  }
+  if (action === "skip" || action === "review") {
+    if (positionals.length !== 1) throw new Error(`checks ${action} needs a check ID`);
+    const state = await service.detail();
+    const check = state.checks[positionals[0]];
+    if (!check) throw new Error(`Unknown check: ${positionals[0]}`);
+    if (action === "review" && !check.value.procedure) throw new Error("Only a review check can receive human review");
+    await service.execute({ version: 1, kind: "check.result", expectedRevision: state.revision, payload: { id: positionals[0], checkRevision: check.revision,
+      status: action === "skip" ? "skipped" : "pass", ...(action === "skip" ? { reason: option(options, "reason") } : { reviewer: option(options, "reviewer") }) } });
+    console.log(`${positionals[0]}: ${action === "skip" ? "skipped" : "passed by reviewer"}`);
+    return 0;
+  }
+  throw new Error("Use orch checks baseline|list|history|add|run|skip|review|approve");
+}
+
+async function actions(args: string[]): Promise<void> {
+  const [operation, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project", "base-revision", "id"]);
+  const service = new CommandService(resolve(option(options, "project") ?? process.cwd()));
+  const state = await service.detail();
+  if (operation === "request") {
+    if (positionals.length !== 3 || !["merge", "deployment"].includes(positionals[0])) throw new Error("actions request needs merge|deployment, destination, and artifact revision");
+    const result = await service.execute({ version: 1, kind: "action.request", expectedRevision: state.revision,
+      payload: { target: positionals[0], destination: positionals[1], artifactRevision: positionals[2],
+        ...(option(options, "base-revision") ? { baseRevision: option(options, "base-revision") } : {}),
+        ...(option(options, "id") ? { id: option(options, "id") } : {}) } });
+    const updated = await service.detail();
+    console.log(`Action ${result.subjectId} revision ${updated.actions[result.subjectId].revision} paused for approval`);
+    return;
+  }
+  if (positionals.length !== 1 || !state.actions[positionals[0]]) throw new Error("actions show|approve|ready needs an existing action ID");
+  const id = positionals[0];
+  const action = state.actions[id];
+  if (operation === "approve") {
+    await service.execute({ version: 1, kind: "approval.grant", expectedRevision: state.revision,
+      payload: { target: action.value.target, targetRevision: action.revision, actionId: id, actor: "user" } });
+  } else if (operation === "ready") {
+    await service.requireActionApproval(id);
+  } else if (operation !== "show") throw new Error("Use orch actions request|show|approve|ready");
+  const updated = await service.detail();
+  console.log(JSON.stringify({ id, revision: updated.actions[id].revision, ...updated.actions[id].value,
+    gate: actionGate(updated, id) ?? null }, null, 2));
+}
+
+async function worktrees(args: string[]): Promise<void> {
+  const [operation, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project", "check"]);
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const service = new CommandService(project);
+  if (operation === "base") {
+    if (positionals.length !== 2 || option(options, "check")) throw new Error("worktrees base needs a branch and exact commit");
+    await service.execute({ version: 1, kind: "worktree.base", expectedRevision: await service.revision(),
+      payload: { branch: positionals[0], commit: positionals[1], actor: "user" } });
+    console.log(`Approved worktree base: ${positionals[0]} ${positionals[1]}`);
+    return;
+  }
+  const manager = await new WorktreeManager(project).load();
+  if (operation === "show") {
+    if (positionals.length || option(options, "check")) throw new Error("worktrees show takes no task IDs");
+    console.log(JSON.stringify({ base: (await service.detail()).worktreeBase ?? null, ...await manager.detail() }, null, 2));
+  } else if (operation === "integrate") {
+    if (positionals.length !== 1 || !option(options, "check")) throw new Error("worktrees integrate needs comma-separated task IDs and --check");
+    const result = await manager.integrate(positionals[0].split(","), option(options, "check")!);
+    console.log(JSON.stringify(result, null, 2));
+  } else if (operation === "merge") {
+    if (positionals.length !== 1 || option(options, "check")) throw new Error("worktrees merge needs one approved action ID");
+    const result = await manager.merge(positionals[0]);
+    console.log(`Merged ${result.commit} into ${result.target}`);
+  } else throw new Error("Use orch worktrees base|show|integrate|merge");
+}
+
+function printChecks(report: Awaited<ReturnType<typeof checkReport>>): void {
+  for (const row of report.rows) console.log(`${row.status.padEnd(7)} ${row.phase.padEnd(11)} ${row.taskId ?? "project"} ${row.id} ${row.criterion ?? row.command ?? row.procedure ?? row.expected}`);
+  console.log(`pass ${report.counts.pass}; fail ${report.counts.fail}; skipped ${report.counts.skipped}; missing ${report.counts.missing}; unrun ${report.counts.unrun}`);
 }
 
 async function status(args: string[]): Promise<void> {
@@ -201,53 +370,93 @@ async function retry(args: string[]): Promise<void> {
   const { positionals, options } = parseArguments(args, ["project"]);
   if (positionals.length !== 1) throw new Error("retry needs one task ID");
   const project = resolve(option(options, "project") ?? process.cwd());
-  const graph = await loadGraph(project);
-  graph.retry(positionals[0]);
-  await saveSnapshot(project, graph.snapshot());
+  const service = new CommandService(project);
+  await service.execute({ version: 1, kind: "plan.retry", expectedRevision: await service.revision(), payload: { taskId: positionals[0] } });
   console.log(`${positionals[0]} reset to pending. Inspect any prior changes before running it again.`);
 }
 
 async function run(args: string[]): Promise<number> {
-  const { positionals, options } = parseArguments(args, ["project", "executor", "check", "once", "timeout-seconds"]);
+  const { positionals, options } = parseArguments(args, ["project", "executor", "check", "once", "timeout-seconds", "resume"]);
   if (positionals.length) throw new Error("run does not accept positional arguments");
   const project = resolve(option(options, "project") ?? process.cwd());
+  const commands = new CommandService(project);
+  const planning = await commands.detail();
+  const resumeId = option(options, "resume");
+  const prior = resumeId ? planning.runs[resumeId] : undefined;
+  if (resumeId && (!prior || prior.value.status !== "paused")) throw new Error("Run ID is not paused");
+  const mode = oneOf(option(options, "executor") ?? (prior?.value.mode === "live" ? "codex" : undefined), ["fake", "codex"] as const, "fake", "executor");
+  if (prior && prior.value.mode !== (mode === "fake" ? "simulated" : "live")) throw new Error("Resume must use the original executor mode");
+  const gate = executionGate(planning);
+  if (gate) {
+    if (!resumeId) {
+      const paused = await commands.execute({ version: 1, kind: "run.record", expectedRevision: planning.revision,
+        payload: { runId: randomUUID(), status: "paused", mode: mode === "fake" ? "simulated" : "live" } });
+      console.log(`Run ${paused.subjectId} paused: ${gate}`);
+    } else console.log(`Run ${resumeId} remains paused: ${gate}`);
+    return 0;
+  }
   const graph = await loadGraph(project);
   const unfinished = graph.snapshot().tasks.filter((record) => record.status === "running");
   if (unfinished.length) throw new Error(`Tasks still marked running: ${unfinished.map((record) => record.spec.id).join(", ")}. Inspect changes and use orch retry after the prior process stops.`);
-  const mode = oneOf(option(options, "executor"), ["fake", "codex"] as const, "fake", "executor");
   const timeoutMs = parseTimeout(option(options, "timeout-seconds"), 600);
   if (mode === "codex" && !option(options, "check")?.trim()) {
     throw new Error("Live Codex runs require --check with a project validation command");
   }
+  if (mode === "codex") {
+    const baseGate = worktreeBaseGate(planning);
+    if (baseGate) throw new Error(baseGate);
+  }
   const knowledge = new KnowledgeStore(project);
   const registry = await loadRegistry(project);
-  const notes = mode === "codex" ? [
-    ...(await knowledge.list("global")).filter((entry) => entry.kind === "note").slice(-10).map((entry) => `[global] ${entry.text.slice(0, 500)}`),
-    ...(await knowledge.list("project")).filter((entry) => entry.kind === "note").slice(-10).map((entry) => `[project] ${entry.text.slice(0, 500)}`),
-  ] : [];
+  const priorEvents = resumeId ? (await readRunEvents(project)).filter((event) => event.runId === resumeId) : [];
+  const events = new RunEventWriter(project, resumeId, priorEvents.at(-1)?.sequence ?? 0);
+  const selectedLessons = new Map<string, SelectedLesson[]>();
+  const recordedSelections = new Set<string>();
   const executor = mode === "fake"
     ? new FakeExecutor()
-    : new CodexExecutor(project, registry, option(options, "check") ?? "", notes, timeoutMs);
-  const events = new RunEventWriter(project);
+    : new WorktreeCodexExecutor(await new WorktreeManager(project).load(), registry, option(options, "check") ?? "", (task) => ({
+      ids: (selectedLessons.get(task.id) ?? []).map(({ entry }) => entry.id),
+      text: (selectedLessons.get(task.id) ?? []).map(({ entry }) => `[${entry.scope}] ${entry.text.slice(0, 500)}`),
+    }), timeoutMs,
+    async (task) => {
+      if (recordedSelections.has(task.id)) return;
+      const selected = selectedLessons.get(task.id) ?? [];
+      await events.append({ type: "knowledge.selected", taskId: task.id,
+        lessonIds: selected.map(({ entry }) => entry.id),
+        selections: selected.map(({ entry, reason }) => ({ id: entry.id, scope: entry.scope, reason })) });
+      recordedSelections.add(task.id);
+    }, (task) => {
+      const drafted = planning.plan.value.draft?.tasks.find((item) => item.id === task.id);
+      return drafted ? [`Acceptance criteria: ${drafted.acceptanceCriteria.join("; ")}.`,
+        `Relevant areas: ${drafted.areas.join(", ")}.`, `Required context: ${drafted.context.join(", ")}.`] : [];
+    });
   await ensureProjectIgnore(project);
   const policyVersion = registry.policyVersion ?? 1;
-  await events.append({ type: "run.started", mode: mode === "fake" ? "simulated" : "live", tasks: graph.snapshot().tasks, policyVersion });
+  await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
+    payload: { runId: events.runId, status: "running", mode: mode === "fake" ? "simulated" : "live" } });
+  await events.append(priorEvents.length ? { type: "run.resumed" } : { type: "run.started", mode: mode === "fake" ? "simulated" : "live", tasks: graph.snapshot().tasks, policyVersion });
   console.log(`Run ID: ${events.runId}`);
-  console.log(mode === "fake" ? "Running with fake workers; project code will not be changed." : "Running live Codex tasks sequentially. Project files may change.");
+  console.log(mode === "fake" ? "Running with fake workers; project code will not be changed." : "Running live Codex tasks in isolated Git worktrees.");
   const recorded = new Map(graph.snapshot().tasks.map((record) => [record.spec.id, record.attempts.length]));
   const result = await orchestrate(graph, executor, async (snapshot) => {
     await saveSnapshot(project, snapshot);
     for (const record of snapshot.tasks) {
       const start = recorded.get(record.spec.id) ?? 0;
       for (const attempt of record.attempts.slice(start)) {
-        await knowledge.recordAttempt("project", record.spec, attempt, mode === "fake");
-        if (mode === "codex") await knowledge.recordAttempt("global", record.spec, attempt, false);
+        await knowledge.recordAttempt("project", record.spec, attempt, mode === "fake", events.runId);
       }
       recorded.set(record.spec.id, record.attempts.length);
     }
   }, {
     maxTasks: options.once === true ? 1 : undefined,
-    onEvent: (event) => events.append(event), simulated: mode === "fake",
+    beforeTask: async () => mode === "codex" ? worktreeBaseGate(await commands.detail()) : executionGate(await commands.detail()),
+    onEvent: async (event) => {
+      await events.append(event);
+      if (mode === "codex" && event.type === "task.started") {
+        const task = graph.get(event.taskId).spec;
+        selectedLessons.set(task.id, await knowledge.retrieve(task));
+      }
+    }, simulated: mode === "fake",
     routeDecision: (task, route, attempt) => {
       const candidates = registry.models.filter((model) => model.provider === "codex" && model.enabled && model.tier === route.label)
         .sort((a, b) => b.weight - a.weight || a.alias.localeCompare(b.alias));
@@ -262,7 +471,17 @@ async function run(args: string[]): Promise<number> {
       };
     },
   });
+  const finalGate = result.paused ?? (mode === "codex" ? worktreeBaseGate(await commands.detail()) : executionGate(await commands.detail()));
+  if (finalGate) {
+    await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
+      payload: { runId: events.runId, status: "paused", mode: mode === "fake" ? "simulated" : "live" } });
+    await events.append({ type: "run.paused", reason: finalGate });
+    console.log(`Run ${events.runId} paused: ${finalGate}`);
+    return 0;
+  }
   await events.append({ type: "run.finished", blocked: result.blocked });
+  await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
+    payload: { runId: events.runId, status: "finished", mode: mode === "fake" ? "simulated" : "live" } });
   for (const [index, batch] of result.batches.entries()) {
     console.log(`Batch ${index + 1}: ${batch.join(" + ")}`);
   }
@@ -300,17 +519,25 @@ async function doctor(args: string[]): Promise<number> {
   return 0;
 }
 
-function registryPathFor(project: string): string {
-  return join(project, ".orch", "models.json");
-}
-
 async function models(args: string[]): Promise<void> {
   const [action, ...rest] = args;
-  const allowed = action === "add" ? ["project", "provider", "model", "tier", "effort", "weight", "enable"] : ["project"];
+  const allowed = action === "add" ? ["project", "provider", "model", "tier", "effort", "weight", "enable"]
+    : action === "recommend" ? ["project", "prices", "manual-alias"] : ["project"];
   const { positionals, options } = parseArguments(rest, allowed);
   const project = resolve(option(options, "project") ?? process.cwd());
   await loadGraph(project);
   const registry = await loadRegistry(project);
+  if (action === "recommend") {
+    if (positionals.length !== 1) throw new Error("models recommend needs one task ID");
+    const task = (await loadGraph(project)).snapshot().tasks.find((record) => record.spec.id === positionals[0])?.spec;
+    if (!task) throw new Error(`Unknown task: ${positionals[0]}`);
+    const priceFile = option(options, "prices");
+    const prices = priceFile ? JSON.parse(await readFile(resolve(priceFile), "utf8")) as PriceSnapshot : undefined;
+    const attempts = (await new KnowledgeStore(project).list("project")).filter((entry) => entry.kind === "attempt");
+    console.log(JSON.stringify(recommendModelRoute({ task, registry, attempts, prices,
+      manualAlias: option(options, "manual-alias") }), null, 2));
+    return;
+  }
   if (action === "list") {
     if (positionals.length) throw new Error("models list takes no aliases");
     for (const item of registry.models) console.log(`${item.alias}  ${item.provider}  ${item.model || "unconfigured"}  ${item.tier}  ${item.effort}  ${item.enabled ? "enabled" : "disabled"}  weight=${item.weight}`);
@@ -329,39 +556,70 @@ async function models(args: string[]): Promise<void> {
       enabled: options.enable === true, weight: Number(option(options, "weight") ?? "1"),
     };
     validateProfile(item);
-    registry.models.push(item);
+    const service = new CommandService(project);
+    await service.execute({ version: 1, kind: "policy.model", expectedRevision: await service.revision(), payload: { action, alias: item.alias, model: item } });
   } else if (action === "enable" || action === "disable" || action === "weight") {
     if (positionals.length !== (action === "weight" ? 2 : 1)) throw new Error(`models ${action} needs an alias${action === "weight" ? " and value" : ""}`);
     const item = registry.models.find((model) => model.alias === positionals[0]);
     if (!item) throw new Error(`Unknown model alias: ${positionals[0]}`);
-    if (action === "weight") item.weight = Number(positionals[1]);
-    else item.enabled = action === "enable";
-    validateProfile(item);
+    const service = new CommandService(project);
+    await service.execute({ version: 1, kind: "policy.model", expectedRevision: await service.revision(),
+      payload: { action, alias: item.alias, ...(action === "weight" ? { weight: positionals[1] } : {}) } });
   } else {
-    throw new Error("Use orch models list|add|enable|disable|weight");
+    throw new Error("Use orch models list|add|enable|disable|weight|recommend");
   }
-  registry.policyVersion = (registry.policyVersion ?? 1) + 1;
-  await saveRegistry(project, registry);
   console.log("Updated model registry.");
 }
 
 async function knowledge(args: string[]): Promise<void> {
   const [action, ...rest] = args;
-  const { positionals, options } = parseArguments(rest, ["scope", "project"]);
+  const allowed = action === "add" ? ["scope", "project", "type"]
+    : action === "review" ? ["project", "status"]
+    : action === "export" ? ["project", "scope", "output"]
+    : action === "list" || action === "remove" ? ["scope", "project"] : ["project"];
+  const { positionals, options } = parseArguments(rest, allowed);
   const project = resolve(option(options, "project") ?? process.cwd());
   await loadGraph(project);
+  await ensureProjectIgnore(project);
   const scope = oneOf(option(options, "scope"), ["project", "global"] as const, "project", "scope") as KnowledgeScope;
   const store = new KnowledgeStore(project);
   if (action === "add") {
-    await store.note(scope, positionals.join(" "));
+    if (scope !== "project") throw new Error("Add a project note, review it, then promote it to global knowledge");
+    await store.note(scope, positionals.join(" "), oneOf(option(options, "type"), taskTypes, "other", "type"));
     console.log(`Saved ${scope} knowledge note.`);
   } else if (action === "list") {
     if (positionals.length) throw new Error("knowledge list takes no text");
     for (const entry of await store.list(scope)) {
-      if (entry.kind === "note") console.log(`${entry.at}  note  ${entry.text}`);
+      if (entry.kind === "note") console.log(`${entry.id}  ${entry.createdAt}  ${entry.reviewStatus}  note  ${entry.text}`);
+      else if (entry.kind === "candidate") console.log(`${entry.id}  ${entry.createdAt}  ${entry.reviewStatus}  candidate  ${entry.text}  evidence=${entry.evidence.map((item) => `${item.runId}/${item.taskId}/${item.attemptId}`).join(",")}${entry.lessonId ? `  lesson=${entry.lessonId}` : ""}`);
       else console.log(`${entry.at}  ${entry.taskId}  ${entry.route}  ${entry.passed ? "passed" : "failed"}  ${entry.simulated ? "simulated" : entry.model ?? "live"}`);
     }
-  } else throw new Error("Use orch knowledge add|list");
+  } else if (action === "review") {
+    if (positionals.length !== 1 || !option(options, "status")) throw new Error("knowledge review needs an ID and --status");
+    const status = oneOf(option(options, "status"), ["pending", "approved", "rejected"] as const, "pending", "status");
+    await store.review(positionals[0], status);
+    console.log(`Reviewed ${positionals[0]}: ${status}`);
+  } else if (action === "promote") {
+    if (positionals.length !== 1) throw new Error("knowledge promote needs one project note ID");
+    const entry = await store.promote(positionals[0]);
+    console.log(`Promoted ${positionals[0]} as ${entry.id}`);
+  } else if (action === "edit") {
+    if (positionals.length < 2) throw new Error("knowledge edit needs an ID and new text");
+    await store.edit(positionals[0], positionals.slice(1).join(" "));
+    console.log(`Edited ${positionals[0]}; review is pending.`);
+  } else if (action === "remove") {
+    if (positionals.length !== 1) throw new Error("knowledge remove needs one ID");
+    await store.remove(scope, positionals[0]);
+    console.log(`Removed ${positionals[0]} from ${scope} knowledge.`);
+  } else if (action === "export") {
+    if (positionals.length) throw new Error("knowledge export takes no IDs");
+    const data = `${JSON.stringify(await store.export(scope), null, 2)}\n`;
+    const output = option(options, "output");
+    if (output) {
+      await writeFile(resolve(output), data, { encoding: "utf8", flag: "wx" });
+      console.log(`Exported ${scope} knowledge to ${resolve(output)}`);
+    } else console.log(data.trimEnd());
+  } else throw new Error("Use orch knowledge add|list|review|promote|edit|remove|export");
 }
 
 async function history(args: string[]): Promise<void> {
@@ -369,10 +627,11 @@ async function history(args: string[]): Promise<void> {
   if (positionals.length) throw new Error("history takes no positional arguments");
   const project = resolve(option(options, "project") ?? process.cwd());
   await loadGraph(project);
+  await ensureProjectIgnore(project);
   const entries = await new KnowledgeStore(project).list("project");
   for (const entry of entries) {
     if (entry.kind !== "attempt") continue;
-    console.log(`${entry.at}  ${entry.taskId}  ${entry.route}  ${entry.passed ? "passed" : "failed"}  ${entry.model ?? "fake"}  tokens=${(entry.inputTokens ?? 0) + (entry.outputTokens ?? 0)}`);
+    console.log(`${entry.at}  ${entry.taskId}  ${entry.route}  ${entry.passed ? "passed" : "failed"}  ${entry.simulated ? "simulated" : "live"}  ${entry.model ?? "fake"}  tokens=${(entry.inputTokens ?? 0) + (entry.outputTokens ?? 0)}`);
   }
 }
 
@@ -380,7 +639,7 @@ async function serve(args: string[]): Promise<void> {
   const { positionals, options } = parseArguments(args, ["project", "port"]);
   if (positionals.length) throw new Error("serve does not accept positional arguments");
   const project = resolve(option(options, "project") ?? process.cwd());
-  await loadGraph(project);
+  await mkdir(project, { recursive: true });
   const port = Number(option(options, "port") ?? "8765");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("--port must be an integer from 1 to 65535");
   const server = createLocalApi(project);
@@ -388,7 +647,15 @@ async function serve(args: string[]): Promise<void> {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => { server.off("error", reject); resolve(); });
   });
-  console.log(`Read-only API: http://127.0.0.1:${port}/api/tasks`);
+  console.log(`Local API: http://127.0.0.1:${port}/api/tasks`);
+}
+
+async function applyCommand(args: string[]): Promise<void> {
+  const { positionals, options } = parseArguments(args, ["project", "json"]);
+  if (positionals.length || !option(options, "json")) throw new Error("command needs --json with a versioned command");
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const result = await new CommandService(project).execute(JSON.parse(option(options, "json")!) as Command);
+  console.log(JSON.stringify(result));
 }
 
 async function installSkill(args: string[]): Promise<void> {
@@ -428,6 +695,11 @@ async function main(args: string[]): Promise<number> {
     case "plan":
       await plan(rest);
       return 0;
+    case "draft":
+      await draft(rest);
+      return 0;
+    case "checks":
+      return checks(rest);
     case "status":
       await status(rest);
       return 0;
@@ -436,6 +708,12 @@ async function main(args: string[]): Promise<number> {
       return 0;
     case "run":
       return run(rest);
+    case "actions":
+      await actions(rest);
+      return 0;
+    case "worktrees":
+      await worktrees(rest);
+      return 0;
     case "doctor":
       return doctor(rest);
     case "models":
@@ -449,6 +727,9 @@ async function main(args: string[]): Promise<number> {
       return 0;
     case "serve":
       await serve(rest);
+      return 0;
+    case "command":
+      await applyCommand(rest);
       return 0;
     case "skill":
       if (rest[0] !== "install") throw new Error("Use orch skill install");

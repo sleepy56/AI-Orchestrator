@@ -24,7 +24,7 @@ test("run events persist in order and local API exposes read-only project state"
       "run.started", "task.started", "route.decided", "attempt.started", "attempt.finished", "task.finished", "run.finished",
     ]);
     assert.equal(events[0].type === "run.started" && events[0].mode, "simulated");
-    assert.equal(events[2].type === "route.decided" && events[2].reason, "medium risk, moderate difficulty, refactor, or analysis");
+    assert.equal(events[2].type === "route.decided" && events[2].reason, "medium risk, refactor, or analysis");
     assert.equal(events[4].type === "attempt.finished" && events[4].simulated, true);
 
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -42,6 +42,7 @@ test("run events persist in order and local API exposes read-only project state"
     assert.equal(models.body.observations[0].liveAttempts, 0);
     const history = await get("/api/history");
     assert.equal(history.body.attempts[0].simulated, true);
+    assert.equal(history.body.attempts[0].sourceRunId, events[0].runId);
     const runs = await get("/api/runs");
     assert.equal(runs.body.runs[0].status, "finished");
     const timeline = await get(`/api/runs/${events[0].runId}/events?after=2`);

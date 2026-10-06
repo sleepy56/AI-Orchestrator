@@ -7,7 +7,10 @@ export type RunMode = "simulated" | "live";
 
 export type RunEventData =
   | { type: "run.started"; mode: RunMode; tasks: TaskSnapshot["tasks"]; policyVersion: number }
+  | { type: "run.resumed" }
+  | { type: "run.paused"; reason: string }
   | { type: "task.started"; taskId: string }
+  | { type: "knowledge.selected"; taskId: string; lessonIds: string[]; selections: Array<{ id: string; scope: "project" | "global"; reason: string }> }
   | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number }
   | { type: "attempt.started"; taskId: string; attempt: number; route: AttemptRecord["route"] }
   | { type: "attempt.finished"; taskId: string; attempt: AttemptRecord; simulated: boolean }
@@ -21,11 +24,11 @@ export function runEventsPath(project: string): string {
 }
 
 export class RunEventWriter {
-  readonly runId = randomUUID();
+  readonly runId: string;
   private sequence = 0;
   private pending: Promise<void> = Promise.resolve();
 
-  constructor(readonly project: string) {}
+  constructor(readonly project: string, runId?: string, sequence = 0) { this.runId = runId ?? randomUUID(); this.sequence = sequence; }
 
   append(data: RunEventData): Promise<void> {
     const event: RunEvent = { ...data, runId: this.runId, sequence: ++this.sequence, at: new Date().toISOString() };
@@ -72,7 +75,7 @@ export interface RunSummary {
   startedAt: string;
   finishedAt?: string;
   lastSequence: number;
-  status: "running" | "finished";
+  status: "running" | "paused" | "finished";
 }
 
 export function summarizeRuns(events: RunEvent[]): RunSummary[] {
@@ -84,6 +87,8 @@ export function summarizeRuns(events: RunEvent[]): RunSummary[] {
       const run = runs.get(event.runId);
       if (!run) continue;
       run.lastSequence = event.sequence;
+      if (event.type === "run.paused") run.status = "paused";
+      if (event.type === "run.resumed") run.status = "running";
       if (event.type === "run.finished") {
         run.status = "finished";
         run.finishedAt = event.at;

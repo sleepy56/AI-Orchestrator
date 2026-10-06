@@ -9,6 +9,7 @@ export class ProviderConfigurationError extends Error {}
 
 interface CodexEvent {
   type?: string;
+  thread_id?: string;
   item?: { type?: string; text?: string };
   usage?: { input_tokens?: number; output_tokens?: number };
   message?: string;
@@ -21,6 +22,7 @@ export interface CodexRunResult {
   inputTokens?: number;
   outputTokens?: number;
   timedOut: boolean;
+  contextId?: string;
 }
 
 export class CodexExecutor implements Executor {
@@ -30,8 +32,10 @@ export class CodexExecutor implements Executor {
     private readonly project: string,
     private readonly registry: ModelRegistry,
     private readonly checkCommand: string,
-    private readonly notes: string[] = [],
+    private readonly notesForTask: (task: TaskSpec) => string[] = () => [],
     private readonly timeoutMs = 600_000,
+    private readonly onPrompt?: (task: TaskSpec) => Promise<void> | void,
+    private readonly contextForTask: (task: TaskSpec) => string[] = () => [],
   ) {
     if (!checkCommand.trim()) throw new Error("Live Codex runs require --check with a project validation command");
   }
@@ -42,12 +46,14 @@ export class CodexExecutor implements Executor {
     catch (error) { throw new ProviderConfigurationError(error instanceof Error ? error.message : String(error)); }
     const started = Date.now();
     console.log(`${task.id}: Codex ${profile.model} (${profile.effort}), attempt ${attempt}`);
+    const notes = this.notesForTask(task);
     const prompt = [
       `Complete task ${task.id} in this repository: ${task.description}`,
       `Task type: ${task.type}. Difficulty: ${task.difficulty}. Risk: ${task.risk}.`,
       "Respect the repository instructions. Make only the changes needed for this task.",
       ...(attempt > 1 ? ["This is a retry. Inspect the existing repository changes first and finish or verify that work; do not start the task over."] : []),
-      ...(this.notes.length ? ["Project and global Orch knowledge:\n" + this.notes.join("\n")] : []),
+      ...(notes.length ? ["Project and global Orch knowledge:\n" + notes.join("\n")] : []),
+      ...this.contextForTask(task),
       "Explain the changes and any tests you ran in your final response.",
     ].join("\n");
     const args = [
@@ -55,15 +61,17 @@ export class CodexExecutor implements Executor {
       "-m", profile.model, "-c", `model_reasoning_effort="${profile.effort}"`, prompt,
     ];
     const launch = await resolveCodexLaunch();
+    await this.onPrompt?.(task);
     let result;
     try { result = await runCodex(launch.command, [...launch.argsPrefix, ...args], this.project, this.timeoutMs, (status) => console.log(`${task.id}: ${status}`)); }
     catch (error) { throw new ProviderConfigurationError(error instanceof Error ? error.message : String(error)); }
     let error = result.timedOut
       ? `Codex produced no output for ${Math.ceil(this.timeoutMs / 1000)} seconds`
       : result.exitCode === 0 ? undefined : `Codex exited ${result.exitCode}: ${result.stderr || "no details"}`;
+    let check: { exitCode: number | null; output: string } | undefined;
     if (!error) {
       console.log(`${task.id}: running validation command`);
-      const check = await runCheck(this.checkCommand, this.project);
+      check = await runCheck(this.checkCommand, this.project);
       if (check.exitCode !== 0) error = `Validation command failed (${check.exitCode}): ${check.output}`;
     }
     return {
@@ -72,6 +80,8 @@ export class CodexExecutor implements Executor {
       retryable: result.exitCode === 0 && !result.timedOut,
       inputTokens: result.inputTokens, outputTokens: result.outputTokens,
       latencyMs: Date.now() - started, checkCommand: this.checkCommand,
+      ...(check ? { checkOutput: check.output, checkExitCode: check.exitCode } : {}),
+      contextId: result.contextId,
       ...(error ? { error } : {}),
     };
   }
@@ -148,6 +158,7 @@ export async function runCodex(
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
     let timedOut = false;
+    let contextId: string | undefined;
     let lastEvent = "";
     let timer: NodeJS.Timeout | undefined;
     const resetIdleTimer = () => {
@@ -172,6 +183,7 @@ export async function runCodex(
           try {
             const event = JSON.parse(line) as CodexEvent;
             if (event.type) {
+              if (event.type === "thread.started" && event.thread_id) contextId = event.thread_id;
               lastEvent = event.type;
               if (["thread.started", "turn.started", "turn.completed", "turn.failed", "error"].includes(event.type)) {
                 onProgress?.(event.type);
@@ -199,7 +211,7 @@ export async function runCodex(
     });
     child.on("close", (exitCode) => {
       clearTimers();
-      resolve({ exitCode, finalResponse, stderr: stderr.trim(), inputTokens, outputTokens, timedOut });
+      resolve({ exitCode, finalResponse, stderr: stderr.trim(), inputTokens, outputTokens, timedOut, contextId });
     });
   });
 }

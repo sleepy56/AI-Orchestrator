@@ -41,6 +41,13 @@ async function mockApi(page: Page, empty = false) {
     if (url.pathname === "/api/tasks") body = { tasks: empty ? [] : tasks.map((task) => ({ ...task, displayStatus: task.spec.dependsOn.length ? "blocked" : "ready" })) };
     else if (url.pathname === "/api/models") body = { models: empty ? [] : models, policyVersion: 1 };
     else if (url.pathname === "/api/history") body = { attempts: empty ? [] : history };
+    else if (url.pathname === "/api/knowledge") body = empty ? { lessons: [], candidates: [], retrieval: [], usedInRuns: [] } : {
+      lessons: [{ id: "reviewed-1", scope: "project", text: "Inspect public references", taskCategory: "test", reviewStatus: "approved", sourceRunId: null }],
+      candidates: [{ id: "candidate-1", text: "Check consumers", taskCategory: "test", reviewStatus: "pending", evidence: [{ attemptId: "a1", runId, taskId: "TASK-001" }] }],
+      retrieval: [{ taskId: "TASK-001", selections: [{ id: "reviewed-1", scope: "project", reason: "category test" }] }],
+      usedInRuns: [{ runId, taskId: "TASK-001", at, mode: "live", lessonIds: ["historical-1"], selections: [{ id: "historical-1", scope: "project", reason: "past task context" }] }],
+    };
+    else if (url.pathname === "/api/model-proposals") body = { proposals: empty ? [] : [{ taskId: "TASK-001", proposal: { chosenAlias: "sol-medium", fallbackAlias: "sol-medium", reason: "Insufficient comparable live evidence", uncertainty: "Observations do not prove success" } }] };
     else if (url.pathname === "/api/runs") body = { runs: empty ? [] : [
       { runId, mode: "live", startedAt: at, lastSequence: 7, status: "finished" },
       { runId: simulatedId, mode: "simulated", startedAt: at, lastSequence: 4, status: "finished" },
@@ -163,4 +170,14 @@ test("Models and Learning keep live and simulated evidence visually distinct", a
   await expect(page.locator(".learning-counts div").first().locator("strong")).toHaveText("1");
   await expect(page.locator(".learning-extra").last()).toContainText("Simulated run attempts");
   await capture(page, testInfo, "learning-simulated-evidence");
+});
+
+test("Knowledge separates current matches from IDs used in a run", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/#knowledge");
+  await expect(page.getByRole("heading", { name: "Reviewed lessons" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Pending candidates" })).toBeVisible();
+  await expect(page.getByText("Current retrieval matches · observational")).toBeVisible();
+  await expect(page.getByText("historical-1", { exact: false })).toBeVisible();
+  await expect(page.getByText("Insufficient comparable live evidence")).toBeVisible();
 });

@@ -13,7 +13,8 @@
     "dev:ui": "npm --prefix ui run dev",
     "demo": "tsc && node dist/demo.js",
     "demo:graph": "tsc && node dist/demo.js --graph",
-    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js dist/knowledge.test.js dist/providers.test.js dist/local-api.test.js"
+    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js dist/knowledge.test.js dist/providers.test.js dist/local-api.test.js",
+    "test:knowledge-next": "tsc && node --test dist/knowledge-system.contract.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",

@@ -40,6 +40,6 @@ export function replayRun(run: Run, allEvents: RunEvent[], sequence: number): Re
   return {
     tasks: tasks.map((task) => ({ ...task, displayStatus: displayStatus(task, byId) })),
     events,
-    run: { ...run, status: events.some((event) => event.type === "run.finished") ? "finished" : "running" },
+    run: { ...run, status: events.some((event) => event.type === "run.finished") ? "finished" : [...events].reverse().find((event) => event.type === "run.paused" || event.type === "run.resumed")?.type === "run.paused" ? "paused" : "running" },
   };
 }
