@@ -15,6 +15,8 @@ import { FakeExecutor } from "./executor";
 import { orchestrate } from "./orchestrator";
 import { TaskGraph } from "./scheduler";
 import { WorktreeManager } from "./worktrees";
+import { localSharedSnapshot, validateSharedSnapshot } from "./shared-metadata";
+import { PostgresMetadata } from "./postgres-metadata";
 
 test("[TASK-021] live CLI workers validate inside separate worktrees and record Codex context IDs", async () => fixture(async (project, other, home) => {
   const git = (...args: string[]) => {
@@ -719,5 +721,73 @@ test("[TASK-017] local UI API registers a previously uninitialized directory", a
   } finally {
     server.closeAllConnections();
     await new Promise<void>((done) => server.close(() => done()));
+  }
+}));
+
+test("[TASK-023] local run projection allows metadata and rejects private or unexpected fields", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const privateText = "Private product architecture prompt and source diff at C:\\secret\\src\\index.ts";
+  assert.equal(cli(project, home, "plan", privateText, "--type", "refactor", "--risk", "high").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const eventFile = join(project, ".orch", "runs.jsonl");
+  const events = (await readFile(eventFile, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, any>);
+  const finished = events.find((event) => event.type === "attempt.finished");
+  assert.ok(finished);
+  finished.attempt.response = privateText;
+  finished.attempt.checkOutput = privateText;
+  finished.rawWorkerOutput = privateText;
+  await writeFile(eventFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  const snapshot = await localSharedSnapshot(project);
+  assert.equal(snapshot.runs.length, 1);
+  assert.equal(snapshot.runs[0].tasks[0].category, "refactor");
+  assert.equal(snapshot.runs[0].tasks[0].risk, "high");
+  assert.equal(snapshot.runs[0].attempts[0].passed, true);
+  assert.doesNotMatch(JSON.stringify(snapshot), /Private|architecture|prompt|source|diff|secret|index\.ts/i);
+  const local = await api<Record<string, any>>(project, home, "/api/commands");
+  assert.equal(local.tasks[0].spec.description, privateText);
+  const localEvents = await api<Record<string, any>>(project, home, `/api/runs/${snapshot.runs[0].runId}/events`);
+  assert.match(JSON.stringify(localEvents), /rawWorkerOutput/);
+  const shared = await api<Record<string, any>>(project, home, "/api/shared/runs");
+  assert.deepEqual(shared, snapshot);
+  const rejects = [
+    { ...snapshot, unexpected: { path: privateText } },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], prompt: privateText }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], tasks: [{ ...snapshot.runs[0].tasks[0], source: privateText }] }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], attempts: [{ ...snapshot.runs[0].attempts[0], rawOutput: privateText }] }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], attempts: [{ ...snapshot.runs[0].attempts[0], model: privateText }] }] },
+  ];
+  const database = new PostgresMetadata();
+  for (const payload of rejects) {
+    assert.throws(() => validateSharedSnapshot(payload), /Unknown|Invalid/);
+    await assert.rejects(database.sync(payload), /Unknown|Invalid/);
+  }
+}));
+
+test("[TASK-023] fresh Docker Postgres migrates and round-trips allowed run metadata", { skip: process.env.ORCH_TEST_POSTGRES !== "1" }, async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "A private task").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const snapshot = await localSharedSnapshot(project);
+  const compose = join(__dirname, "..", "compose.yaml");
+  const name = `orch023${process.pid}`;
+  const docker = (...args: string[]) => spawnSync("docker", ["compose", "-f", compose, "-p", name, ...args], { encoding: "utf8", timeout: 120_000 });
+  const started = docker("up", "-d", "--wait");
+  assert.equal(started.status, 0, started.stderr);
+  try {
+    const store = new PostgresMetadata(name);
+    await store.migrate();
+    await store.migrate();
+    await store.sync(snapshot);
+    await store.sync(snapshot);
+    const rows = await store.runs(snapshot.projectId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].runId, snapshot.runs[0].runId);
+    assert.equal(rows[0].mode, "simulated");
+    assert.equal((rows[0].tasks as unknown[]).length, 1);
+    assert.equal((rows[0].attempts as unknown[]).length, 1);
+    assert.doesNotMatch(JSON.stringify(rows), /private task/i);
+  } finally {
+    const stopped = docker("down", "-v");
+    assert.equal(stopped.status, 0, stopped.stderr);
   }
 }));
