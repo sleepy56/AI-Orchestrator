@@ -23,6 +23,91 @@ import { PostgresMetadata } from "./postgres-metadata";
 import { resolveRoute } from "./routing-policy";
 import { recommendModelRoute } from "./model-decisions";
 
+test("[TASK-025] CLI and local UI API share revisions, approvals, runs, learning, and private detail only while connected", async () => fixture(async (project, _other, home) => {
+  const privateTask = "Implement private product architecture at src/private.ts";
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", privateTask, "--type", "analysis").status, 0);
+  const service = new CommandService(project);
+  const afterCli = await service.detail();
+  const previousHome = process.env.ORCH_HOME;
+  process.env.ORCH_HOME = home;
+  const server = createLocalApi(project);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  const get = async (path: string) => {
+    const response = await fetch(`${base}${path}`);
+    assert.equal(response.status, 200, path);
+    return response.json() as Promise<Record<string, any>>;
+  };
+  const post = async (path: string, body: unknown) => {
+    const response = await fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const result = await response.json() as Record<string, any>;
+    assert.equal(response.status, 200, JSON.stringify(result));
+    return result;
+  };
+  try {
+    const local = await get("/api/commands");
+    assert.equal(local.revision, afterCli.revision);
+    assert.equal(local.tasks[0].spec.description, privateTask);
+    const workflow = await get("/api/workflow");
+    assert.equal(workflow.revision, afterCli.revision);
+    assert.equal(workflow.capacity.availability, "unknown");
+    assert.deepEqual(workflow.worktrees.workers, {});
+    assert.equal(workflow.policy.version, afterCli.policy.revision);
+
+    // These are the same command envelopes sent by the Planning UI.
+    await post("/api/commands", { version: 1, kind: "approval.grant", expectedRevision: local.revision,
+      payload: { target: "plan", targetRevision: local.plan.revision, actor: "user" } });
+    assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
+    const run = await post("/api/workflow", { operation: "run", mode: "fake", once: true });
+    assert.match(run.id, /^[0-9a-f-]{36}$/);
+    let runJob: Record<string, any> | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      runJob = (await get("/api/workflow")).jobs.find((job: Record<string, any>) => job.id === run.id);
+      if (runJob?.status !== "running") break;
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    assert.equal(runJob?.status, "finished", runJob?.errorOutput);
+    assert.match(runJob.output, /Running with fake workers/);
+    assert.match(cli(project, home, "status").stdout, /TASK-001  completed/);
+    const updated = await get("/api/workflow");
+    assert.ok(Object.values(updated.runs).some((record: any) => record.value.status === "finished"));
+
+    await writeFile(join(project, "limits.json"), JSON.stringify({ blockedModels: ["gpt-6-luna"] }));
+    assert.equal(cli(project, home, "models", "limits", "--file", "limits.json", "--reason", "User budget").status, 0);
+    const afterLimits = await get("/api/workflow");
+    assert.equal(afterLimits.policy.version, 1);
+    assert.deepEqual(afterLimits.policy.routing.limits.blockedModels, ["gpt-6-luna"]);
+    assert.equal(afterLimits.policy.history[0].reason, "User budget");
+    await post("/api/commands", { version: 1, kind: "policy.limits", expectedRevision: afterLimits.revision,
+      payload: { actor: "user", reason: "Allow reviewed Codex routes", limits: { allowedProviders: ["codex"] } } });
+    const cliPolicy = JSON.parse(cli(project, home, "models", "policy").stdout);
+    assert.equal(cliPolicy.version, 2);
+    assert.equal(cliPolicy.history.at(-1).reason, "Allow reviewed Codex routes");
+
+    const note = await post("/api/knowledge/action", { operation: "add", text: "For analysis tasks, inspect public references", taskCategory: "analysis" });
+    assert.match(cli(project, home, "knowledge", "list").stdout, new RegExp(note.id));
+    await post("/api/knowledge/action", { operation: "review", id: note.id, status: "approved" });
+    const promoted = await post("/api/knowledge/action", { operation: "promote", id: note.id });
+    assert.match(cli(project, home, "knowledge", "list", "--scope", "global").stdout, new RegExp(promoted.id));
+    const shared = JSON.stringify(await get("/api/commands/shared"));
+    assert.doesNotMatch(shared, /private product architecture|src\/private\.ts|inspect public references|gpt-6-luna|User budget/);
+    assert.equal(shared.includes(project), false);
+    const sharedRuns = JSON.stringify(await get("/api/shared/runs"));
+    assert.doesNotMatch(sharedRuns, /private product architecture|src\/private\.ts|inspect public references/);
+    assert.equal(sharedRuns.includes(project), false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+    if (previousHome === undefined) delete process.env.ORCH_HOME;
+    else process.env.ORCH_HOME = previousHome;
+  }
+  await assert.rejects(fetch(`${base}/api/commands`));
+  await assert.rejects(fetch(`${base}/api/workflow`));
+}));
+
 test("[TASK-022] a provider capacity failure defers its task instead of failing it", async () => {
   const task: TaskSpec = { id: "TASK-001", description: "Rename a symbol", type: "rename", difficulty: "easy", risk: "low", dependsOn: [] };
   const graph = TaskGraph.fromSpecs([task]);
@@ -582,14 +667,17 @@ test("[TASK-018] consequential clarification yields an editable acyclic review d
   assert.equal(local.plan.revision, state.plan.revision);
   assert.equal(local.plan.value.draft.tasks[0].id, "TASK-101");
   const run = cli(project, home, "run", "--once");
-  assert.notEqual(run.status, 0);
-  assert.deepEqual((await service.detail()).runs, {});
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /paused/);
+  assert.ok(Object.values((await service.detail()).runs).every((record) => record.value.status === "paused"));
   assert.equal(cli(project, home, "draft", "approve").status, 0);
   assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
   state = await service.detail();
   await service.execute({ version: 1, kind: "plan.draft", expectedRevision: state.revision, payload: { tasks } });
   assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, false);
-  assert.notEqual(cli(project, home, "run", "--once").status, 0);
+  const revisedRun = cli(project, home, "run", "--once");
+  assert.equal(revisedRun.status, 0, revisedRun.stderr);
+  assert.match(revisedRun.stdout, /paused/);
 }));
 
 async function fixture(work: (a: string, b: string, home: string) => Promise<void>) {
