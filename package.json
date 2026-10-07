@@ -6,7 +6,7 @@
   "bin": {
     "orch": "dist/cli.js"
   },
-  "files": ["dist", "skills", "README.md"],
+  "files": ["dist", "compose.yaml", "migrations", "skills", "README.md"],
   "scripts": {
     "build": "tsc",
     "build:ui": "npm --prefix ui run build",

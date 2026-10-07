@@ -19,6 +19,8 @@ import { TaskGraph } from "./scheduler";
 import { Difficulty, Risk, TaskSnapshot, TaskType } from "./types";
 import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
 import { CapacityScheduler, capacityAvailability, readCapacity } from "./capacity";
+import { PostgresMetadata } from "./postgres-metadata";
+import { localSharedSnapshot } from "./shared-metadata";
 
 type Options = Record<string, string | boolean>;
 
@@ -70,6 +72,7 @@ function usage(): string {
     "  orch history [--project directory]",
     "  orch serve [--project directory] [--port 8765]  (local API)",
     "  orch command --json '{...}' [--project directory]  (versioned local command)",
+    "  orch shared migrate|sync|runs [--project directory]  (Docker Postgres)",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
@@ -718,6 +721,18 @@ async function applyCommand(args: string[]): Promise<void> {
   console.log(JSON.stringify(result));
 }
 
+async function shared(args: string[]): Promise<void> {
+  const [action, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project"]);
+  if (positionals.length || !["migrate", "sync", "runs"].includes(action)) throw new Error("Use shared migrate|sync|runs [--project directory]");
+  const database = new PostgresMetadata();
+  if (action === "migrate") { await database.migrate(); console.log("Shared metadata schema migrated"); return; }
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const snapshot = await localSharedSnapshot(project);
+  if (action === "sync") { await database.migrate(); await database.sync(snapshot); console.log(`Synced ${snapshot.runs.length} runs for ${snapshot.projectId}`); }
+  else console.log(JSON.stringify(await database.runs(snapshot.projectId)));
+}
+
 async function installSkill(args: string[]): Promise<void> {
   const { positionals, options } = parseArguments(args, ["to", "force"]);
   if (positionals.length) throw new Error("skill install does not accept positional arguments");
@@ -793,6 +808,9 @@ async function main(args: string[]): Promise<number> {
       return 0;
     case "command":
       await applyCommand(rest);
+      return 0;
+    case "shared":
+      await shared(rest);
       return 0;
     case "skill":
       if (rest[0] !== "install") throw new Error("Use orch skill install");
