@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Client, QueryResult } from "pg";
 import { assertReusable, KnowledgeStore } from "./knowledge";
 import { PostgresMetadata } from "./postgres-metadata";
 import { validateSharedSnapshot } from "./shared-metadata";
@@ -39,22 +39,21 @@ export function neonConfig(environment: NeonEnvironment, env: NodeJS.ProcessEnv 
 }
 
 export const psqlNeonTransport: NeonTransport = {
-  query(sql, config) {
-    return new Promise((resolve, reject) => {
-      const child = spawn("psql", ["-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"], {
-        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, PGHOST: config.host, PGPORT: config.port, PGDATABASE: config.database,
-          PGUSER: config.user, PGPASSWORD: config.password, PGSSLMODE: "verify-full", PGSSLROOTCERT: "system", PGCHANNELBINDING: "require" },
-      });
-      let output = "";
-      let error = "";
-      child.stdout.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
-      child.stderr.setEncoding("utf8").on("data", (chunk: string) => { error += chunk; });
-      child.on("error", () => reject(new Error("Neon psql client is unavailable")));
-      child.stdin.on("error", () => { /* Child startup failure is reported by the error event. */ });
-      child.on("close", (code) => code === 0 ? resolve(output.trim()) : reject(new Error(`Neon query failed: ${error.replaceAll(config.password, "[redacted]").trim() || `exit ${code}`}`)));
-      child.stdin.end(sql);
-    });
+  async query(sql, config) {
+    const client = new Client({ host: config.host, port: Number(config.port), database: config.database,
+      user: config.user, password: config.password, ssl: { rejectUnauthorized: true }, enableChannelBinding: true });
+    try {
+      await client.connect();
+      const response = await client.query(sql);
+      const last = Array.isArray(response) ? response.at(-1) as QueryResult | undefined : response;
+      const row = last?.rows[0] as Record<string, unknown> | undefined;
+      return row ? JSON.stringify(Object.values(row)[0]) : "";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Neon query failed: ${message.replaceAll(config.password, "[redacted]")}`);
+    } finally {
+      await client.end().catch(() => undefined);
+    }
   },
 };
 
@@ -81,8 +80,9 @@ export function validateSharedLessons(input: unknown): SharedLesson[] {
 
 export async function localSharedLessons(project: string, home?: string): Promise<SharedLesson[]> {
   const entries = await new KnowledgeStore(project, home).list("global");
-  return validateSharedLessons(entries.map((entry) => {
-    if (entry.kind !== "note" || entry.scope !== "global") throw new Error("Invalid global lesson for Neon sync");
+  return validateSharedLessons(entries.filter((entry) => entry.kind === "note" && entry.scope === "global" &&
+    entry.reviewStatus === "approved").map((entry) => {
+    if (entry.kind !== "note") throw new Error("Invalid global lesson for Neon sync");
     return { id: entry.id, text: entry.text, taskCategory: entry.taskCategory, updatedAt: entry.updatedAt,
       reviewStatus: entry.reviewStatus, sourceEntryId: entry.sourceEntryId };
   }));

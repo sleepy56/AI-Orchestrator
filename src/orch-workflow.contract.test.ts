@@ -1058,9 +1058,12 @@ test("[TASK-026] Neon fake transport sends allowlisted runs and reviewed generic
   const pending = await store.note("project", "Review reusable refactor boundaries", "refactor");
   assert.throws(() => validateSharedLessons([{ id: pending.id, text: pending.text, taskCategory: pending.taskCategory,
     updatedAt: pending.updatedAt, reviewStatus: "pending", sourceEntryId: pending.id }]), /Invalid/);
-  assert.equal(cli(project, home, "knowledge", "review", pending.id, "--status", "approved").status, 0);
-  assert.equal(cli(project, home, "knowledge", "promote", pending.id).status, 0);
-  const lessons = await localSharedLessons(project, home);
+    assert.equal(cli(project, home, "knowledge", "review", pending.id, "--status", "approved").status, 0);
+    assert.equal(cli(project, home, "knowledge", "promote", pending.id).status, 0);
+    await writeFile(join(home, "knowledge.jsonl"), `${JSON.stringify({ kind: "attempt", at: "2026-01-01T00:00:00.000Z",
+      taskId: "OLD-1", taskType: "refactor", difficulty: "moderate", risk: "medium", route: "sol-medium",
+      model: "codex:gpt-6-sol", passed: true, errors: [], simulated: false })}\n`);
+    const lessons = await localSharedLessons(project, home);
   assert.equal(lessons.length, 1);
   assert.throws(() => validateSharedLessons([{ ...lessons[0], text: "Inspect C:\\secret\\source.ts" }]), /generalized/);
   assert.throws(() => validateSharedLessons([{ ...lessons[0], rawOutput: "private" }]), /Unknown/);

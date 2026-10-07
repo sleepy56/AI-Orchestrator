@@ -99,7 +99,7 @@ Sync is explicit. It projects local run events to opaque IDs, task category, ris
 
 ## Optional Neon sync
 
-Neon sync runs only when invoked. Configure separate Neon branch connection strings in the server-side environment as `ORCH_NEON_DEVELOPMENT_URL` and `ORCH_NEON_PRODUCTION_URL`. Install PostgreSQL `psql` 16 or later on that machine. Run `orch shared neon sync --environment development --project /path/to/your-project` (or choose `production` explicitly). `orch shared neon migrate` and `orch shared neon runs` take the same environment option. The adapter connects with database credentials using verified TLS and channel binding; the connection string is never sent to the browser or workers. Use separate Neon databases or branches for the two settings.
+Neon sync runs only when invoked. Configure separate Neon branch connection strings in the server-side environment as `ORCH_NEON_DEVELOPMENT_URL` and `ORCH_NEON_PRODUCTION_URL`. Run `orch shared neon sync --environment development --project /path/to/your-project` (or choose `production` explicitly). `orch shared neon migrate` and `orch shared neon runs` take the same environment option. The adapter uses the Node PostgreSQL client with verified TLS and channel binding; the connection string is never sent to the browser or workers. Use separate Neon databases or branches for the two settings.
 
 The Neon adapter uses the same run allowlist as local Postgres. It also sends only the ID, text, task category, and update time of approved, promoted global lessons that pass the generalized-text guard. Project notes, attempts, candidates, audit trails, provenance, and repository detail stay local. A sync error leaves local run and knowledge files intact; local CLI and dashboard operations do not depend on Neon.
 
@@ -133,10 +133,10 @@ Run UI unit and browser checks from `ui/` with `npm test` and `npm run test:e2e`
 npm run demo
 npm run demo:graph
 npm test
-node scripts/check-task.cjs TASK-015
+npm --prefix ui test
 ```
 
-The TASK-015 check compiles the backend and UI, runs backend and UI regressions, then runs the tagged integration tests and the existing knowledge contracts. The integration fixtures exercise legacy import, privacy across two projects, retrieval, candidate deduplication, simulated filtering, weighted model choice, manual override, fallback, and CLI/API agreement. The UI contract checks that recorded run use is displayed separately from current observational matches.
+`npm test` runs the backend regressions and the completed task contracts. `npm --prefix ui test` runs the UI evidence and workflow contracts. The integration fixtures exercise legacy import, privacy across two projects, retrieval, candidate deduplication, simulated filtering, weighted model choice, manual override, fallback, and CLI/API agreement. The UI contract checks that recorded run use is displayed separately from current observational matches.
 
 The [TASK-027 example workflow](docs/example-workflow.md) describes the complete question-to-merge test fixture and how to run its acceptance gate.
 

@@ -7,7 +7,8 @@ Run the acceptance gate from this repository after installing dependencies:
 ```sh
 npm install
 npm --prefix ui install
-node scripts/check-task.cjs TASK-027
+npm test
+npm --prefix ui test
 ```
 
 The fixture checks these transitions in one run:
