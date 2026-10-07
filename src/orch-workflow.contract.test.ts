@@ -1108,6 +1108,210 @@ test("[TASK-026] configured Neon test database round-trips metadata and a global
   assert.doesNotMatch(JSON.stringify(rows), /Private source context/);
 }));
 
+test("[TASK-027] example project completes clarification, approved live work, conflict review, rollback, and private sync", async () => fixture(async (project, other, home) => {
+  const privateDetail = "Private product architecture at C:\\secret\\source.ts";
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", ["-c", `safe.directory=${project.replace(/\\/g, "/")}`, ...args], { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\n");
+  await writeFile(join(project, "README.md"), `${privateDetail}\n`);
+  await writeFile(join(project, "shared.txt"), "base\n");
+  git("add", ".gitignore", "README.md", "shared.txt");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Example base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(cli(project, home, "init", "--docs", "README.md").status, 0);
+
+  const tasks = ["left", "right"].map((side, index) => ({
+    id: `TASK-10${index + 1}`, description: `Write ${side} export format`, type: "analysis", difficulty: "moderate", risk: "medium", dependsOn: [],
+    acceptanceCriteria: [`${side} export is reviewable`], areas: ["shared.txt"], workerProfile: "sol-medium", context: ["README.md"],
+    verification: [`review: Inspect ${side} export against the chosen format`],
+  }));
+  const planning = new PlanningWorkflow(project, { propose: async ({ answers }) => answers
+    ? { questions: [], tasks }
+    : { questions: [{ id: "format", question: "Which export format is required?", impact: "Changes the worker checks and merge result" }], tasks: [] } });
+  await planning.start(`Add an export for ${privateDetail}`);
+  const service = new CommandService(project);
+  let state = await service.detail();
+  assert.equal(state.plan.value.draft?.status, "clarifying");
+  assert.equal(state.tasks.length, 0);
+  assert.match(cli(project, home, "run", "--once").stdout, /paused: Plan revision/);
+  await planning.answer({ format: "CSV" }, await service.revision());
+  state = await service.detail();
+  assert.equal(state.plan.value.draft?.answers.format, "CSV");
+  assert.equal(state.tasks.length, 0);
+  const planRevision = state.plan.revision;
+  const checkCommand = "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').trim()==='left'?0:1)\"";
+  const added = cli(project, home, "checks", "add", "TASK-101", "--command", checkCommand, "--phase", "task",
+    "--timeout-seconds", "20", "--expected", "exit 0", "--criterion", "left export is reviewable");
+  assert.equal(added.status, 0, added.stderr);
+  const checkId = /Check ([0-9a-f-]{36})/.exec(added.stdout)?.[1];
+  assert.ok(checkId, added.stdout);
+  state = await service.detail();
+  assert.equal(state.checks[checkId].value.command, checkCommand);
+  assert.equal(state.checks[checkId].value.timeoutSeconds, 20);
+  assert.match(executionGate(state) ?? "", /Plan revision/);
+
+  const postLocal = async (command: Record<string, unknown>) => {
+    const server = createLocalApi(project);
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+      const response = await fetch(`${baseUrl}/api/commands`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(command) });
+      const result = await response.json() as Record<string, any>;
+      assert.equal(response.status, 200, JSON.stringify(result));
+      const detail = await (await fetch(`${baseUrl}/api/commands`)).json() as Record<string, any>;
+      return { result, detail };
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    }
+  };
+  const planApproval = await postLocal({ version: 1, kind: "approval.grant", expectedRevision: state.revision,
+    payload: { target: "plan", targetRevision: planRevision, actor: "user" } });
+  assert.equal(planApproval.detail.tasks.length, 2, "the approved draft becomes the executable graph");
+  assert.equal(planApproval.detail.tasks[0].spec.id, "TASK-101");
+  assert.equal(planApproval.detail.revision, (await service.detail()).revision);
+  assert.match(cli(project, home, "run", "--once").stdout, /paused: Checks revision/);
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
+  state = await service.detail();
+  assert.equal(executionGate(state), undefined);
+  assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
+  assert.equal((await api<Record<string, any>>(project, home, "/api/commands")).checksRevision, state.checksRevision);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const capture = join(other, "worker-capture.jsonl");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, [
+    "const fs = require('node:fs');",
+    "const id = /Complete task (TASK-\\d+)/.exec(process.argv.at(-1))[1];",
+    "if (fs.readFileSync('shared.txt','utf8').trim() !== 'base') process.exit(2);",
+    "fs.writeFileSync('shared.txt', id === 'TASK-101' ? 'left\\n' : 'right\\n');",
+    "fs.appendFileSync(process.env.ORCH_CAPTURE, JSON.stringify({id,cwd:process.cwd(),prompt:process.argv.at(-1)})+'\\n');",
+    "console.log(JSON.stringify({type:'thread.started',thread_id:'thread-' + id}));",
+    "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));",
+    "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1000,output_tokens:100}}));",
+  ].join("\n"));
+  await writeFile(join(bin, "codex.cmd"), "rem fake Codex launcher\n");
+  await writeFile(join(bin, "codex"), `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(join(bin, "codex"), 0o755);
+  const path = process.platform === "win32" ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const live = (...args: string[]) => spawnSync(process.execPath, [join(__dirname, "cli.js"), ...args], {
+    cwd: project, encoding: "utf8", timeout: 60_000, env: { ...process.env, ORCH_HOME: home, ORCH_CAPTURE: capture, PATH: path },
+  });
+  const workerCheck = "node -e \"process.exit(['left','right'].includes(require('fs').readFileSync('shared.txt','utf8').trim())?0:1)\"";
+  const signal = join(project, ".orch", "capacity.json");
+  await writeFile(signal, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1000, limitTokens: 1000000, maxConcurrent: 2 }));
+  const paused = live("run", "--executor", "codex", "--check", workerCheck);
+  assert.equal(paused.status, 0, paused.stderr);
+  const runId = /Run ID: ([0-9a-f-]{36})/.exec(paused.stdout)?.[1];
+  assert.ok(runId, paused.stdout);
+  assert.match(paused.stdout, /Provider capacity near exhaustion/);
+  assert.equal(Object.keys((await (await new WorktreeManager(project).load()).detail()).workers).length, 0);
+  assert.equal((await service.detail()).runs[runId].value.status, "paused");
+  await writeFile(signal, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1000000, limitTokens: 1000000, maxConcurrent: 2 }));
+  const resumed = live("run", "--resume", runId, "--check", workerCheck);
+  assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+  assert.equal((await service.detail()).runs[runId].value.status, "finished");
+  const manager = await new WorktreeManager(project).load();
+  const workers = (await manager.detail()).workers;
+  assert.notEqual(workers["TASK-101"].path, workers["TASK-102"].path);
+  assert.equal(workers["TASK-101"].base, base);
+  assert.equal(workers["TASK-102"].base, base);
+  assert.ok(Object.values(workers).every((record) => record.validation?.passed));
+  assert.equal((await service.detail()).checks[checkId].results.at(-1)?.status, "pass");
+  const captured = (await readFile(capture, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as { id: string; cwd: string; prompt: string });
+  assert.deepEqual(new Set(captured.map((item) => item.id)), new Set(["TASK-101", "TASK-102"]));
+  assert.ok(captured.every((item) => item.cwd === workers[item.id].path && item.prompt.includes("pinned base")));
+  assert.equal(git("rev-parse", "main"), base);
+
+  const store = new KnowledgeStore(project, home);
+  const price = { version: "example-2026-10", currency: "USD", models: {
+    "codex:gpt-6-sol": { inputPerMillion: 10, outputPerMillion: 20 }, "codex:gpt-6-luna": { inputPerMillion: 1, outputPerMillion: 2 },
+  } };
+  await writeFile(join(project, ".orch", "prices.json"), JSON.stringify(price));
+  for (const route of ["sol-medium", "luna-medium"] as const) for (let index = 0; index < 8; index++) {
+    const model = route === "sol-medium" ? "codex:gpt-6-sol" : "codex:gpt-6-luna";
+    await store.append("project", { kind: "attempt", id: `${route}-${index}-1`, scope: "project", sourceProject: "example", sourceRunId: `${route}-${index}`,
+      at: "2026-10-01T00:00:00.000Z", taskId: `HIST-${route}-${index}`, attemptNumber: 1, taskType: "analysis", difficulty: "moderate", risk: "medium",
+      route, model, passed: route === "sol-medium" || index !== 0, errors: [], simulated: false, inputTokens: 1000, outputTokens: 100,
+      latencyMs: route === "luna-medium" ? 500 : 1000 } as AttemptEntry);
+    if (route === "luna-medium" && index === 0) await store.append("project", { kind: "attempt", id: `${route}-${index}-2`, scope: "project", sourceProject: "example", sourceRunId: `${route}-${index}`,
+      at: "2026-10-01T00:00:01.000Z", taskId: `HIST-${route}-${index}`, attemptNumber: 2, taskType: "analysis", difficulty: "moderate", risk: "medium",
+      route, model, passed: true, errors: [], simulated: false, inputTokens: 1000, outputTokens: 100, latencyMs: 500 } as AttemptEntry);
+  }
+  const applied = cli(project, home, "models", "apply", "TASK-101");
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal((await service.detail()).policy.value.routing?.rules["analysis:moderate:medium"]?.alias, "luna-medium");
+  const rolled = cli(project, home, "models", "rollback", "0", "--reason", "Restore established route after review");
+  assert.equal(rolled.status, 0, rolled.stderr);
+  assert.deepEqual((await service.detail()).policy.value.routing?.rules, {});
+  assert.equal((await service.detail()).policy.value.history?.at(-1)?.cause, "rollback");
+  assert.match((await api<Record<string, any>>(project, home, "/api/workflow")).policy.history.at(-1).reason, /Restore established route/);
+
+  const integration = await manager.integrate(["TASK-101", "TASK-102"], workerCheck);
+  assert.deepEqual(integration.conflicts, ["shared.txt"]);
+  assert.equal(integration.actionId, undefined);
+  assert.equal(git("rev-parse", "main"), base);
+  await assert.rejects(manager.verifyIntegration(integration.id, workerCheck), /Resolve all integration conflicts/);
+  await writeFile(join(integration.path, "shared.txt"), "left and right\n");
+  git("-C", integration.path, "add", "shared.txt");
+  git("-C", integration.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Resolve export conflict");
+  const combinedCheck = "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').trim()==='left and right'?0:1)\"";
+  const verified = await manager.verifyIntegration(integration.id, combinedCheck);
+  assert.equal(verified.check?.passed, true, verified.check?.output);
+  assert.ok(verified.actionId);
+  assert.notEqual(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  const mergeState = await service.detail();
+  const mergeApproval = await postLocal({ version: 1, kind: "approval.grant", expectedRevision: mergeState.revision,
+    payload: { target: "merge", actionId: verified.actionId, targetRevision: mergeState.actions[verified.actionId!].revision, actor: "user" } });
+  assert.equal(mergeApproval.detail.actions[verified.actionId!].value.artifactRevision, verified.commit);
+  assert.equal(cli(project, home, "actions", "ready", verified.actionId!).status, 0);
+  assert.equal(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  assert.equal(git("rev-parse", "main"), verified.commit);
+  assert.equal((await readFile(join(project, "shared.txt"), "utf8")).trim(), "left and right");
+
+  const lesson = await store.note("project", "For analysis tasks, inspect bounded evidence", "analysis");
+  assert.throws(() => validateSharedLessons([{ id: lesson.id, text: lesson.text, taskCategory: "analysis", updatedAt: lesson.updatedAt,
+    reviewStatus: "pending", sourceEntryId: lesson.id }]), /Invalid/);
+  await store.review(lesson.id, "approved");
+  await store.promote(lesson.id);
+  const lessons = await localSharedLessons(project, home);
+  const snapshot = await localSharedSnapshot(project);
+  assert.equal(snapshot.runs.some((run) => run.runId === runId && run.status === "finished"), true);
+  const privateBoundary = `${privateDetail}|source\\.ts|worker-capture|left and right|Restore established route`;
+  assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(privateBoundary, "i"));
+  assert.doesNotMatch(JSON.stringify(await service.sharedView()), new RegExp(privateBoundary, "i"));
+  assert.throws(() => validateSharedSnapshot({ ...snapshot, source: privateDetail }), /Unknown/);
+  const localQueries: string[] = [];
+  class CapturingPostgres extends PostgresMetadata {
+    protected query(sql: string): Promise<string> { localQueries.push(sql); return Promise.resolve(""); }
+  }
+  await new CapturingPostgres().sync(snapshot);
+  const cloudQueries: string[] = [];
+  const config = neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-example.neon.tech/dev?sslmode=require" });
+  const neon = new NeonMetadata(config, { query: async (sql) => { cloudQueries.push(sql); return ""; } });
+  await neon.sync(snapshot, lessons);
+  assert.match(localQueries.join("\n"), /INSERT INTO shared_runs/);
+  assert.match(cloudQueries.join("\n"), /shared_global_lessons/);
+  assert.doesNotMatch(localQueries.join("\n") + cloudQueries.join("\n"), new RegExp(privateBoundary + "|password", "i"));
+  await assert.rejects(neon.sync({ ...snapshot, rawOutput: privateDetail }, lessons), /Unknown/);
+  assert.equal(cloudQueries.length, 1);
+
+  const completed = await service.detail();
+  await service.execute({ version: 1, kind: "plan.draft", expectedRevision: completed.revision,
+    payload: { tasks: [{ ...tasks[0], description: "Change the completed left export" }, tasks[1]] } });
+  assert.notEqual(cli(project, home, "draft", "approve").status, 0);
+  assert.equal((await service.detail()).tasks[0].spec.description, tasks[0].description);
+}));
+
 test("[TASK-024] live route evidence creates a versioned policy, user limits override it, and rollback restores the earlier route", async () => fixture(async (project, other, home) => {
   assert.equal(cli(project, home, "init").status, 0);
   assert.equal(cli(project, home, "plan", "Analyze a route", "--type", "analysis", "--difficulty", "moderate", "--risk", "medium").status, 0);

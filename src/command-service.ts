@@ -503,6 +503,22 @@ export class CommandService {
           const id = opaqueId(payload.id ?? randomUUID(), "approval id");
           if (state.approvals[id]) throw new Error(`Approval already exists: ${id}`);
           if (hasApproval(state, target, targetRevision as number, actionId)) throw new Error("Revision is already approved");
+          if (target === "plan" && state.plan.value.draft) {
+            const existing = await this.tasks();
+            const draft = state.plan.value.draft.tasks;
+            const proposed = TaskGraph.fromSpecs(draft.map(({ acceptanceCriteria, areas, workerProfile, context, verification, testArtifacts, ...spec }) => spec)).snapshot();
+            if (existing.tasks.length && (existing.tasks.length !== proposed.tasks.length ||
+                existing.tasks.some((record) => !proposed.tasks.some((item) => item.spec.id === record.spec.id)))) {
+              throw new Error("Cannot replace a task graph with different task IDs");
+            }
+            const progressed = existing.tasks.some((record) => record.status !== "pending" || record.attempts.length);
+            if (progressed && existing.tasks.some((record) =>
+              JSON.stringify(record.spec) !== JSON.stringify(proposed.tasks.find((item) => item.spec.id === record.spec.id)?.spec))) {
+              throw new Error("Cannot change executable tasks after workers started");
+            }
+            if (!progressed) snapshot = proposed;
+            state.plan.value.taskIds = draft.map((task) => task.id);
+          }
           state.approvals[id] = { revision: 1, value: { target, targetRevision: targetRevision as number, actor: "user", ...(actionId ? { actionId } : {}), at: new Date().toISOString() } };
           subjectId = id;
           break;
