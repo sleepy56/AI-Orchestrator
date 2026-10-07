@@ -1,4 +1,6 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { KnowledgeStore } from "./knowledge";
@@ -11,6 +13,67 @@ import { Command, CommandService } from "./command-service";
 import { checkReport, runBaseline, runCheck } from "./checks";
 import { PlanningWorkflow } from "./planning";
 import { localSharedSnapshot } from "./shared-metadata";
+import { constrainProposal } from "./routing-policy";
+import { capacityAvailability, readCapacity } from "./capacity";
+import { WorktreeManager } from "./worktrees";
+
+interface WorkflowJob { id: string; startedAt: string; status: "running" | "finished" | "failed"; output: string; errorOutput: string; exitCode?: number | null }
+
+function startRun(project: string, args: string[], jobs: Map<string, WorkflowJob>): WorkflowJob {
+  for (const [id, previous] of jobs) if (jobs.size >= 20 && previous.status !== "running") jobs.delete(id);
+  if (jobs.size >= 20) throw new Error("Too many active local run requests");
+  const job: WorkflowJob = { id: randomUUID(), startedAt: new Date().toISOString(), status: "running", output: "", errorOutput: "" };
+  jobs.set(job.id, job);
+  const child = spawn(process.execPath, args, { cwd: project, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.on("data", (chunk: Buffer) => { job.output = (job.output + chunk.toString()).slice(-8192); });
+  child.stderr.on("data", (chunk: Buffer) => { job.errorOutput = (job.errorOutput + chunk.toString()).slice(-8192); });
+  child.on("error", (error: Error) => { job.status = "failed"; job.errorOutput = (job.errorOutput + error.message).slice(-8192); });
+  child.on("close", (code: number | null) => { job.exitCode = code; job.status = code === 0 ? "finished" : "failed"; });
+  return job;
+}
+
+function fields(body: unknown, allowed: string[]): Record<string, unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !allowed.includes(key))) throw new Error("Invalid workflow request");
+  return body as Record<string, unknown>;
+}
+function required(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} required`);
+  return value;
+}
+
+async function workflowAction(project: string, input: unknown, jobs: Map<string, WorkflowJob>): Promise<unknown> {
+  const body = fields(input, ["operation", "mode", "once", "resume", "check", "timeoutSeconds", "taskIds", "integrationId", "actionId"]);
+  const operation = required(body.operation, "Operation");
+  if (operation === "run") {
+    if (Object.keys(body).some((key) => !["operation", "mode", "once", "resume", "check", "timeoutSeconds"].includes(key))) throw new Error("Invalid run request");
+    if (body.mode !== "fake" && body.mode !== "codex") throw new Error("Executor must be fake or codex");
+    if (body.once !== undefined && typeof body.once !== "boolean") throw new Error("Invalid once value");
+    const args = [join(__dirname, "cli.js"), "run", "--project", project, "--executor", body.mode];
+    if (body.once) args.push("--once");
+    if (body.resume !== undefined) args.push("--resume", required(body.resume, "Run ID"));
+    if (body.check !== undefined) args.push("--check", required(body.check, "Validation command"));
+    if (body.timeoutSeconds !== undefined) {
+      if (!Number.isSafeInteger(body.timeoutSeconds) || (body.timeoutSeconds as number) < 1 || (body.timeoutSeconds as number) > 3600) throw new Error("Invalid timeout");
+      args.push("--timeout-seconds", String(body.timeoutSeconds));
+    }
+    if (body.mode === "codex" && !body.check) throw new Error("Live runs require a validation command");
+    return startRun(project, args, jobs);
+  }
+  const manager = await new WorktreeManager(project).load();
+  if (operation === "integrate") {
+    if (Object.keys(body).some((key) => !["operation", "taskIds", "check"].includes(key)) || !Array.isArray(body.taskIds) || !body.taskIds.length || body.taskIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id))) throw new Error("Task IDs required");
+    return manager.integrate(body.taskIds as string[], required(body.check, "Validation command"));
+  }
+  if (operation === "verify") {
+    if (Object.keys(body).some((key) => !["operation", "integrationId", "check"].includes(key))) throw new Error("Invalid verify request");
+    return manager.verifyIntegration(required(body.integrationId, "Integration ID"), required(body.check, "Validation command"));
+  }
+  if (operation === "merge") {
+    if (Object.keys(body).some((key) => !["operation", "actionId"].includes(key))) throw new Error("Invalid merge request");
+    return manager.merge(required(body.actionId, "Action ID"));
+  }
+  throw new Error("Unknown workflow operation");
+}
 
 async function requestBody(request: IncomingMessage): Promise<unknown> {
   let body = "";
@@ -41,6 +104,7 @@ function json(response: ServerResponse, status: number, body: unknown): void {
 }
 
 export function createLocalApi(project: string): Server {
+  const jobs = new Map<string, WorkflowJob>();
   return createServer(async (request: IncomingMessage, response: ServerResponse) => {
     const host = request.headers.host ?? "";
     if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return json(response, 403, { error: "Local host required" });
@@ -93,6 +157,43 @@ export function createLocalApi(project: string): Server {
         return json(response, 200, await new CommandService(project).register(body.documents));
       } catch (error) { return json(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
     }
+    if (request.method === "POST" && request.url === "/api/workflow") {
+      if (request.headers["content-type"]?.split(";")[0] !== "application/json") return json(response, 415, { error: "JSON required" });
+      try { return json(response, 200, await workflowAction(project, await requestBody(request), jobs)); }
+      catch (error) { return json(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    if (request.method === "POST" && request.url === "/api/knowledge/action") {
+      if (request.headers["content-type"]?.split(";")[0] !== "application/json") return json(response, 415, { error: "JSON required" });
+      try {
+        const body = fields(await requestBody(request), ["operation", "id", "status", "text", "taskCategory", "scope"]);
+        await new CommandService(project).detail();
+        const store = new KnowledgeStore(project);
+        const operation = required(body.operation, "Knowledge operation");
+        if (operation === "add") {
+          if (Object.keys(body).some((key) => !["operation", "text", "taskCategory"].includes(key))) throw new Error("Invalid add request");
+          if (!(["rename", "refactor", "analysis", "test", "other"] as unknown[]).includes(body.taskCategory)) throw new Error("Invalid task category");
+          return json(response, 200, await store.note("project", required(body.text, "Lesson text"), body.taskCategory as "rename" | "refactor" | "analysis" | "test" | "other"));
+        }
+        if (operation === "review") {
+          if (Object.keys(body).some((key) => !["operation", "id", "status"].includes(key)) || body.status !== "approved" && body.status !== "rejected") throw new Error("Invalid review request");
+          return json(response, 200, await store.review(required(body.id, "Knowledge ID"), body.status));
+        }
+        if (operation === "edit") {
+          if (Object.keys(body).some((key) => !["operation", "id", "text"].includes(key))) throw new Error("Invalid edit request");
+          return json(response, 200, await store.edit(required(body.id, "Knowledge ID"), required(body.text, "Lesson text")));
+        }
+        if (operation === "promote") {
+          if (Object.keys(body).some((key) => !["operation", "id"].includes(key))) throw new Error("Invalid promote request");
+          return json(response, 200, await store.promote(required(body.id, "Knowledge ID")));
+        }
+        if (operation === "remove") {
+          if (Object.keys(body).some((key) => !["operation", "id", "scope"].includes(key)) || body.scope !== "project" && body.scope !== "global") throw new Error("Invalid remove request");
+          await store.remove(body.scope, required(body.id, "Knowledge ID"));
+          return json(response, 200, { removed: body.id });
+        }
+        throw new Error("Unknown knowledge operation");
+      } catch (error) { return json(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
     if (request.method !== "GET") return json(response, 405, { error: "Read-only API" });
     const url = new URL(request.url ?? "/", `http://${host}`);
     try {
@@ -103,6 +204,13 @@ export function createLocalApi(project: string): Server {
       if (url.pathname === "/api/commands") return json(response, 200, await new CommandService(project).detail());
       if (url.pathname === "/api/checks") return json(response, 200, await checkReport(new CommandService(project), url.searchParams.get("taskId") ?? undefined));
       if (url.pathname === "/api/commands/shared") return json(response, 200, await new CommandService(project).sharedView());
+      if (url.pathname === "/api/workflow") {
+        const [detail, worktrees, signal] = await Promise.all([new CommandService(project).detail(), new WorktreeManager(project).load(), readCapacity(project)]);
+        return json(response, 200, { revision: detail.revision, base: detail.worktreeBase ?? null, worktrees: await worktrees.detail(),
+          capacity: { availability: capacityAvailability(signal), ...(signal ? { signal } : {}) },
+          policy: { version: detail.policy.revision, routing: detail.policy.value.routing ?? { limits: {}, rules: {} }, history: detail.policy.value.history ?? [] },
+          runs: detail.runs, jobs: [...jobs.values()] });
+      }
       if (url.pathname === "/api/shared/runs") return json(response, 200, await localSharedSnapshot(project));
       if (url.pathname === "/api/tasks") return json(response, 200, { tasks: await tasks(project) });
       if (url.pathname === "/api/models") {
@@ -123,6 +231,7 @@ export function createLocalApi(project: string): Server {
           knowledge.list("project"), knowledge.list("global"), readRunEvents(project), tasks(project),
         ]);
         const lessons = [...projectEntries, ...globalEntries].filter((entry) => entry.kind === "note" && entry.reviewStatus === "approved");
+        const notes = projectEntries.filter((entry) => entry.kind === "note" && entry.reviewStatus !== "approved");
         const candidates = projectEntries.filter((entry) => entry.kind === "candidate" && entry.reviewStatus === "pending");
         const retrieval = await Promise.all(taskRecords.map(async (record) => ({ taskId: record.spec.id,
           selections: (await knowledge.retrieve(record.spec)).map(({ entry, reason }) => ({ id: entry.id, scope: entry.scope, reason })),
@@ -132,15 +241,16 @@ export function createLocalApi(project: string): Server {
           runId: event.runId, taskId: event.taskId, at: event.at, mode: modes.get(event.runId) ?? "live",
           lessonIds: event.lessonIds, selections: event.selections,
         }));
-        return json(response, 200, { lessons, candidates, retrieval, usedInRuns });
+        return json(response, 200, { lessons, notes, candidates, retrieval, usedInRuns });
       }
       if (url.pathname === "/api/model-proposals") {
-        const [taskRecords, registry, entries, prices] = await Promise.all([
-          tasks(project), loadRegistry(project), new KnowledgeStore(project).list("project"), priceSnapshot(project),
+        const [taskRecords, registry, entries, prices, detail] = await Promise.all([
+          tasks(project), loadRegistry(project), new KnowledgeStore(project).list("project"), priceSnapshot(project), new CommandService(project).detail(),
         ]);
         const attempts = entries.filter((entry) => entry.kind === "attempt");
+        const routing = detail.policy.value.routing ?? { limits: {}, rules: {} };
         return json(response, 200, { priceVersion: prices?.version, proposals: taskRecords.map((record) => ({
-          taskId: record.spec.id, proposal: recommendModelRoute({ task: record.spec, registry, attempts, prices }),
+          taskId: record.spec.id, proposal: constrainProposal(recommendModelRoute({ task: record.spec, registry, attempts, prices }), record.spec, routing, registry, attempts, prices),
         })) });
       }
       if (url.pathname === "/api/runs") return json(response, 200, { runs: summarizeRuns(await readRunEvents(project)) });

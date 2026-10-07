@@ -93,6 +93,13 @@ export class TaskGraph {
     delete record.failureReason;
   }
 
+  defer(id: string, attempts: AttemptRecord[]): void {
+    const record = this.get(id);
+    if (record.status !== "running") throw new Error(`Task ${id} is not running`);
+    record.attempts.push(...attempts);
+    record.status = "pending";
+  }
+
   finish(id: string, attempts: AttemptRecord[], passed: boolean): void {
     const record = this.get(id);
     if (record.status !== "running") throw new Error(`Task ${id} is not running`);
