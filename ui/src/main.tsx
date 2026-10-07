@@ -7,6 +7,7 @@ import { TaskGraph } from "./task-graph";
 import { WorkerMap } from "./worker-map";
 import { LearningView, ModelsView } from "./models-learning";
 import { KnowledgeView } from "./knowledge-view";
+import { WorkflowView } from "./workflow-view";
 import { replayRun } from "./replay";
 import "./styles.css";
 
@@ -36,7 +37,7 @@ function eventLabel(event: RunEvent): string {
 }
 
 function App() {
-  const [view, setView] = useState<"overview" | "models" | "learning" | "knowledge" | "project" | "planning">(() => viewFromHash());
+  const [view, setView] = useState<"overview" | "models" | "learning" | "knowledge" | "project" | "planning" | "workflow">(() => viewFromHash());
   const [data, setData] = useState<OverviewData>();
   const [projectData, setProjectData] = useState<ProjectData>();
   const [error, setError] = useState<string>();
@@ -52,14 +53,14 @@ function App() {
       const project = await loadProject(signal);
       if (signal.aborted) return;
       setProjectData(project);
-      if (!project.registered) { setView("project"); setError(undefined); return; }
+      if (!project.registered) { setData(undefined); setView("project"); setError(undefined); return; }
       const next = await loadOverview(signal, selectedRunId);
       if (signal.aborted) return;
       setData(next);
       setError(undefined);
       setUpdatedAt(new Date());
     } catch (cause) {
-      if (!signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+      if (!signal.aborted) { setData(undefined); setProjectData(undefined); setError(cause instanceof Error ? cause.message : String(cause)); }
     } finally {
       if (!signal.aborted) setRefreshing(false);
     }
@@ -122,13 +123,14 @@ function App() {
           <a className={`nav-item ${view === "knowledge" ? "active" : ""}`} href="#knowledge" aria-current={view === "knowledge" ? "page" : undefined}><span aria-hidden="true">◇</span> Knowledge</a>
           <a className={`nav-item ${view === "project" ? "active" : ""}`} href="#project" aria-current={view === "project" ? "page" : undefined}><span aria-hidden="true">⌂</span> Project</a>
           <a className={`nav-item ${view === "planning" ? "active" : ""}`} href="#planning" aria-current={view === "planning" ? "page" : undefined}><span aria-hidden="true">◇</span> Planning</a>
+          <a className={`nav-item ${view === "workflow" ? "active" : ""}`} href="#workflow" aria-current={view === "workflow" ? "page" : undefined}><span aria-hidden="true">◎</span> Runs and routing</a>
         </nav>
-        <div className="sidebar-bottom"><span className="connection-dot" aria-hidden="true" /> Local project <span className="sidebar-version">v0.1</span></div>
+        <div className="sidebar-bottom"><span className={`connection-dot ${error ? "offline" : ""}`} aria-hidden="true" /> Local project {error ? "offline" : "connected"} <span className="sidebar-version">v0.1</span></div>
       </aside>
 
       <main id="main-content" className="main-content" tabIndex={-1}>
         <header className="topbar">
-          <div className="breadcrumb">Workspace <span>/</span> <strong>{view === "overview" ? "Overview" : view === "models" ? "Models" : view === "project" ? "Project" : "Learning"}</strong></div>
+          <div className="breadcrumb">Workspace <span>/</span> <strong>{{ overview: "Overview", models: "Models", learning: "Learning", knowledge: "Knowledge", project: "Project", planning: "Planning", workflow: "Runs and routing" }[view]}</strong></div>
           <div className="topbar-actions"><button type="button" onClick={() => void refresh(new AbortController().signal)} disabled={refreshing}>↻ <span>Refresh</span></button></div>
         </header>
 
@@ -138,10 +140,11 @@ function App() {
 
           {projectData && view === "project" && <ProjectRegistration data={projectData} onRegistered={() => void refresh(new AbortController().signal)} />}
           {projectData?.registered && view === "planning" && <PlanningView />}
+          {projectData?.registered && view === "workflow" && <WorkflowView />}
 
           {data && view === "models" && <ModelsView models={data.models} attempts={data.attempts} policyVersion={data.policyVersion} />}
           {data && view === "learning" && <LearningView models={data.models} attempts={data.attempts} policyVersion={data.policyVersion} />}
-          {data && view === "knowledge" && <KnowledgeView knowledge={data.knowledge} proposals={data.proposals} tasks={data.tasks} />}
+          {data && view === "knowledge" && <KnowledgeView knowledge={data.knowledge} proposals={data.proposals} tasks={data.tasks} onChanged={() => void refresh(new AbortController().signal)} />}
           {data && view === "overview" && <>
             <div className="page-intro"><div><div className="eyebrow">PROJECT CONTROL CENTER</div><h1>Overview</h1><p>Live task state and validation evidence from your local Orch API.</p></div><div className="update-time" aria-live="polite">{updatedAt ? `Updated ${updatedAt.toLocaleTimeString()}` : "Connecting to local API"}</div></div>
             <section className="run-banner" aria-labelledby="run-heading">
@@ -193,8 +196,8 @@ function App() {
   );
 }
 
-function viewFromHash(): "overview" | "models" | "learning" | "knowledge" | "project" | "planning" {
-  return window.location.hash === "#models" ? "models" : window.location.hash === "#learning" ? "learning" : window.location.hash === "#knowledge" ? "knowledge" : window.location.hash === "#project" ? "project" : window.location.hash === "#planning" ? "planning" : "overview";
+function viewFromHash(): "overview" | "models" | "learning" | "knowledge" | "project" | "planning" | "workflow" {
+  return window.location.hash === "#models" ? "models" : window.location.hash === "#learning" ? "learning" : window.location.hash === "#knowledge" ? "knowledge" : window.location.hash === "#project" ? "project" : window.location.hash === "#planning" ? "planning" : window.location.hash === "#workflow" ? "workflow" : "overview";
 }
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);
