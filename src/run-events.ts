@@ -2,6 +2,7 @@ import { open, readFile, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AttemptRecord, TaskSnapshot } from "./types";
+import type { RouteLimits } from "./routing-policy";
 
 export type RunMode = "simulated" | "live";
 
@@ -12,7 +13,7 @@ export type RunEventData =
   | { type: "task.started"; taskId: string }
   | { type: "task.interrupted"; taskId: string; reason: string }
   | { type: "knowledge.selected"; taskId: string; lessonIds: string[]; selections: Array<{ id: string; scope: "project" | "global"; reason: string }> }
-  | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number }
+  | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number; fallbackAlias?: string; constraint?: string; userLimits?: RouteLimits; observedEvidenceIds?: string[] }
   | { type: "attempt.started"; taskId: string; attempt: number; route: AttemptRecord["route"] }
   | { type: "attempt.finished"; taskId: string; attempt: AttemptRecord; simulated: boolean }
   | { type: "task.finished"; taskId: string; status: "completed" | "failed"; failureReason?: string }

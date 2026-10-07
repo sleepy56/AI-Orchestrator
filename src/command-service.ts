@@ -5,10 +5,13 @@ import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "no
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { TaskGraph } from "./scheduler";
 import { defaultRegistry, loadRegistry, ModelProfile, saveRegistry, validateProfile } from "./models";
+import { PriceSnapshot, recommendModelRoute } from "./model-decisions";
+import { KnowledgeStore, AttemptEntry } from "./knowledge";
+import { allowedProfile, emptyRouting, parseLimits, PolicyRevision, routeKey, RoutingState } from "./routing-policy";
 import { Difficulty, Risk, TaskSnapshot, TaskSpec, TaskType } from "./types";
 
 // This file is local state. Only sharedView() may be passed to a shared store.
-export type CommandKind = "project.update" | "project.register" | "plan.add" | "plan.retry" | "plan.goal" | "plan.answer" | "plan.draft" | "check.put" | "check.result" | "action.request" | "approval.grant" | "run.record" | "policy.put" | "policy.model" | "worktree.base";
+export type CommandKind = "project.update" | "project.register" | "plan.add" | "plan.retry" | "plan.goal" | "plan.answer" | "plan.draft" | "check.put" | "check.result" | "action.request" | "approval.grant" | "run.record" | "policy.put" | "policy.model" | "policy.limits" | "policy.route" | "policy.rollback" | "worktree.base";
 export interface PlanningQuestion { id: string; question: string; impact: string }
 export interface DraftTask { id: string; description: string; type: TaskType; difficulty: Difficulty; risk: Risk; dependsOn: string[]; acceptanceCriteria: string[]; areas: string[]; workerProfile: string; context: string[]; verification: string[]; testArtifacts?: Array<{ name: string; content: string }> }
 export interface PlanningDraft { goal: string; questions: PlanningQuestion[]; answers: Record<string, string>; tasks: DraftTask[]; status: "clarifying" | "review" }
@@ -36,7 +39,7 @@ interface LocalState {
   actions: Record<string, Versioned<ActionRequest>>;
   runs: Record<string, Versioned<{ status: string; mode: string; planRevision?: number; checksRevision?: number; reason?: string }>>;
   worktreeBase?: { branch: string; commit: string; planRevision: number; checksRevision: number; contextVersion: number };
-  policy: Versioned<{ rules: Record<string, unknown> }>;
+  policy: Versioned<{ rules: Record<string, unknown>; routing?: RoutingState; history?: PolicyRevision[] }>;
   audit: AuditEvent[];
 }
 
@@ -312,7 +315,7 @@ export class CommandService {
       audit: state.audit.map(({ id, at, kind, revision }) => {
         opaqueId(id, "audit id");
         if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(at)) throw new Error("Invalid audit timestamp");
-        if (!["project.update", "project.register", "plan.add", "plan.retry", "plan.goal", "plan.answer", "plan.draft", "check.put", "check.result", "action.request", "approval.grant", "run.record", "policy.put", "policy.model", "worktree.base"].includes(kind)) throw new Error("Invalid audit kind");
+        if (!["project.update", "project.register", "plan.add", "plan.retry", "plan.goal", "plan.answer", "plan.draft", "check.put", "check.result", "action.request", "approval.grant", "run.record", "policy.put", "policy.model", "policy.limits", "policy.route", "policy.rollback", "worktree.base"].includes(kind)) throw new Error("Invalid audit kind");
         return { id, at, kind, revision: validRevision(revision, "audit revision") };
       }) };
   }
@@ -525,9 +528,71 @@ export class CommandService {
           break;
         }
         case "policy.put": {
-          state.policy.value = { rules: object(payload.rules, "rules") };
+          state.policy.value.rules = object(payload.rules, "rules");
           state.policy.revision++;
           subjectId = "policy";
+          break;
+        }
+        case "policy.limits":
+        case "policy.route":
+        case "policy.rollback": {
+          const before = structuredClone(state.policy.value.routing ?? emptyRouting());
+          const after = structuredClone(before);
+          const history = state.policy.value.history ?? [];
+          let cause: PolicyRevision["cause"];
+          let author: PolicyRevision["author"];
+          let reason: string;
+          let evidenceIds: string[] = [];
+          let baseline: PolicyRevision["baseline"];
+          let candidate: PolicyRevision["candidate"];
+          let priceVersion: string | undefined;
+          let currency: string | undefined;
+          if (command.kind === "policy.limits") {
+            if (payload.actor !== "user") throw new Error("Only the user can change routing limits");
+            after.limits = parseLimits(payload.limits);
+            cause = "limits"; author = "user";
+            reason = string(payload.reason, "reason");
+          } else if (command.kind === "policy.rollback") {
+            if (payload.actor !== "user") throw new Error("Only the user can roll back routing");
+            const target = payload.targetVersion;
+            if (!Number.isSafeInteger(target) || (target as number) < 0 || (target as number) >= state.policy.revision) throw new Error("Invalid rollback version");
+            const old = target === 0 ? emptyRouting() : history.find((item) => item.version === target)?.after;
+            if (!old) throw new Error("Rollback target has no routing snapshot");
+            after.rules = structuredClone(old.rules);
+            cause = "rollback"; author = "user";
+            reason = string(payload.reason, "reason");
+          } else {
+            const taskId = safeId(payload.taskId, "task ID");
+            const task = (await this.tasks()).tasks.find((record) => record.spec.id === taskId)?.spec;
+            if (!task) throw new Error(`Unknown task: ${taskId}`);
+            registry = await loadRegistry(this.directory);
+            const attempts = (await new KnowledgeStore(this.directory).list("project")).filter((entry): entry is AttemptEntry => entry.kind === "attempt");
+            const prices = JSON.parse(await readFile(join(this.directory, ".orch", "prices.json"), "utf8")) as PriceSnapshot;
+            const proposal = recommendModelRoute({ task, registry, attempts, prices });
+            if (!proposal.recommendedAlias || !proposal.baseline || !proposal.candidate) throw new Error(`No validated automatic route: ${proposal.reason}`);
+            const chosen = registry.models.find((item) => item.alias === proposal.recommendedAlias)!;
+            const fallback = registry.models.find((item) => item.alias === proposal.fallbackAlias)!;
+            for (const profile of [chosen, fallback]) {
+              const check = allowedProfile(profile, after.limits, task, registry, attempts, prices);
+              if (!check.allowed) throw new Error(`Route ${profile.alias} violates user limits: ${check.reason}`);
+            }
+            after.rules[routeKey(task)] = { alias: chosen.alias, fallbackAlias: fallback.alias };
+            baseline = proposal.baseline; candidate = proposal.candidate;
+            evidenceIds = [...new Set([...baseline.evidenceIds, ...candidate.evidenceIds])];
+            if (evidenceIds.length !== baseline.attemptCount + candidate.attemptCount) throw new Error("Automatic route needs identified live attempt evidence");
+            priceVersion = proposal.priceVersion; currency = proposal.currency;
+            cause = "live-outcomes"; author = "orch"; reason = proposal.reason;
+          }
+          if (JSON.stringify(before) === JSON.stringify(after)) throw new Error("Routing policy is unchanged");
+          const version = state.policy.revision + 1;
+          history.push({ version, at: new Date().toISOString(), author, cause, reason, before, after: structuredClone(after),
+            evidenceIds, ...(priceVersion ? { priceVersion } : {}), ...(currency ? { currency } : {}),
+            ...(baseline ? { baseline } : {}), ...(candidate ? { candidate } : {}), rollbackTo: state.policy.revision });
+          state.policy.value.routing = after;
+          state.policy.value.history = history;
+          state.policy.revision = version;
+          subjectId = "policy";
+          registry = undefined;
           break;
         }
         case "policy.model": {

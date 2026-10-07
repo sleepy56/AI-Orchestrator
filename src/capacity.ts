@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { KnowledgeStore, AttemptEntry } from "./knowledge";
-import { ModelRegistry, selectModel } from "./models";
+import { ModelProfile, ModelRegistry, selectModel } from "./models";
 import { routeTask } from "./router";
 import { TaskSpec } from "./types";
 import { PriceSnapshot } from "./model-decisions";
@@ -65,15 +65,18 @@ export async function readSchedulerLimits(project: string): Promise<SchedulerLim
 export class CapacityScheduler {
   private constructor(private readonly project: string, private readonly registry: ModelRegistry,
     private readonly limits: SchedulerLimits, private readonly history: AttemptEntry[],
-    private readonly areas: Map<string, string[]>, private readonly prices?: PriceSnapshot) {}
+    private readonly areas: Map<string, string[]>, private readonly prices?: PriceSnapshot,
+    private readonly profileForTask?: (task: TaskSpec) => ModelProfile) {}
 
-  static async load(project: string, registry: ModelRegistry): Promise<CapacityScheduler> {
+  static async load(project: string, registry: ModelRegistry, profileForTask?: (task: TaskSpec) => ModelProfile,
+    policyMaxCostUsd?: number): Promise<CapacityScheduler> {
     const limits = await readSchedulerLimits(project);
+    if (policyMaxCostUsd !== undefined) limits.maxProjectedCostUsd = Math.min(limits.maxProjectedCostUsd ?? Infinity, policyMaxCostUsd);
     const history = (await new KnowledgeStore(project).list("project")).filter((entry): entry is AttemptEntry => entry.kind === "attempt" && !entry.simulated);
     const detail = await new CommandService(project).detail();
     const areas = new Map((detail.plan.value.draft?.tasks ?? []).map((task) => [task.id, task.areas]));
     const prices = await optionalJson(join(project, ".orch", "prices.json")) as PriceSnapshot | undefined;
-    return new CapacityScheduler(project, registry, limits, history, areas, prices);
+    return new CapacityScheduler(project, registry, limits, history, areas, prices, profileForTask);
   }
 
   async decide(task: TaskSpec, inFlight: TaskSpec[]): Promise<CapacityDecision> {
@@ -118,7 +121,7 @@ export class CapacityScheduler {
   }
 
   private samples(task: TaskSpec): AttemptEntry[] {
-    const profile = selectModel(this.registry, routeTask(task));
+    const profile = this.profileForTask?.(task) ?? selectModel(this.registry, routeTask(task));
     return this.history.filter((row) => row.taskType === task.type && row.difficulty === task.difficulty &&
       row.risk === task.risk && row.model === `${profile.provider}:${profile.model}` && row.route === profile.tier &&
       nonnegative(row.inputTokens) && nonnegative(row.outputTokens));
@@ -143,7 +146,7 @@ export class CapacityScheduler {
   }
   private price(task: TaskSpec): { inputPerMillion: number; outputPerMillion: number } | undefined {
     if (this.prices?.currency !== "USD" || !this.prices.version?.trim()) return undefined;
-    const profile = selectModel(this.registry, routeTask(task));
+    const profile = this.profileForTask?.(task) ?? selectModel(this.registry, routeTask(task));
     const price = this.prices?.models?.[`${profile.provider}:${profile.model}`];
     return price && nonnegative(price.inputPerMillion) && nonnegative(price.outputPerMillion) ? price : undefined;
   }

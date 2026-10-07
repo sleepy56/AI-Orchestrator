@@ -11,6 +11,7 @@ import { Command, CommandService } from "./command-service";
 import { checkReport, runBaseline, runCheck } from "./checks";
 import { PlanningWorkflow } from "./planning";
 import { localSharedSnapshot } from "./shared-metadata";
+import { constrainProposal } from "./routing-policy";
 
 async function requestBody(request: IncomingMessage): Promise<unknown> {
   let body = "";
@@ -135,12 +136,13 @@ export function createLocalApi(project: string): Server {
         return json(response, 200, { lessons, candidates, retrieval, usedInRuns });
       }
       if (url.pathname === "/api/model-proposals") {
-        const [taskRecords, registry, entries, prices] = await Promise.all([
-          tasks(project), loadRegistry(project), new KnowledgeStore(project).list("project"), priceSnapshot(project),
+        const [taskRecords, registry, entries, prices, detail] = await Promise.all([
+          tasks(project), loadRegistry(project), new KnowledgeStore(project).list("project"), priceSnapshot(project), new CommandService(project).detail(),
         ]);
         const attempts = entries.filter((entry) => entry.kind === "attempt");
+        const routing = detail.policy.value.routing ?? { limits: {}, rules: {} };
         return json(response, 200, { priceVersion: prices?.version, proposals: taskRecords.map((record) => ({
-          taskId: record.spec.id, proposal: recommendModelRoute({ task: record.spec, registry, attempts, prices }),
+          taskId: record.spec.id, proposal: constrainProposal(recommendModelRoute({ task: record.spec, registry, attempts, prices }), record.spec, routing, registry, attempts, prices),
         })) });
       }
       if (url.pathname === "/api/runs") return json(response, 200, { runs: summarizeRuns(await readRunEvents(project)) });
