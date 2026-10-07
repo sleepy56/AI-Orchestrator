@@ -514,12 +514,13 @@ export class CommandService {
           if (status === "paused" && previous && previous.value.status !== "running") throw new Error("Run is not running");
           if (status === "running" && previous && previous.value.status !== "paused") throw new Error("Run is not paused");
           if (status === "running" && runGate) throw new Error(runGate);
-          if (status === "paused" && !runGate) throw new Error("No execution approval gate is pending");
+          const pauseReason = status === "paused" ? (runGate ?? (payload.reason === undefined ? undefined : string(payload.reason, "pause reason"))) : undefined;
+          if (status === "paused" && !pauseReason) throw new Error("A pause reason is required");
           if ((status === "finished" || status === "failed") && previous?.value.status !== "running") throw new Error("Run is not running");
           if (previous?.value.status === "finished" || previous?.value.status === "failed") throw new Error("Run already ended");
           state.runs[id] = { revision: (previous?.revision ?? 0) + 1, value: { status, mode,
             planRevision: state.plan.revision, checksRevision: state.checksRevision,
-            ...(status === "paused" ? { reason: runGate } : {}) } };
+            ...(status === "paused" ? { reason: pauseReason } : {}) } };
           subjectId = id;
           break;
         }
