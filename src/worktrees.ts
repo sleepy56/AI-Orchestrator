@@ -12,7 +12,7 @@ import { ExecutionResult, Route } from "./types";
 import { runCheck } from "./checks";
 
 const exec = promisify(execFile);
-interface WorkerRecord { taskId: string; branch: string; path: string; approvedBase: string; targetBranch: string; base: string; dependencies: Record<string, string>; contextDocuments: string[]; lessonIds: string[]; contextId?: string; commit?: string; validation?: { passed: boolean; command: string; output: string } }
+interface WorkerRecord { taskId: string; branch: string; path: string; approvedBase: string; targetBranch: string; base: string; dependencies: Record<string, string>; integrationIds?: string[]; contextDocuments: string[]; lessonIds: string[]; contextId?: string; commit?: string; validation?: { passed: boolean; command: string; output: string } }
 interface IntegrationRecord { id: string; branch: string; path: string; target: string; base: string; taskIds: string[]; conflicts: string[]; diff: string; commit?: string; check?: { command: string; passed: boolean; output: string }; actionId?: string; merged?: boolean }
 interface WorktreeState { workers: Record<string, WorkerRecord>; integrations: Record<string, IntegrationRecord> }
 
@@ -69,14 +69,28 @@ export class WorktreeManager {
       if (worker.approvedBase !== approved.commit || worker.targetBranch !== approved.branch) throw new Error(`Dependency ${id} belongs to a different approved base`);
       dependencies[id] = worker.commit;
     }
+    const covered = new Set<string>();
+    const integrationIds: string[] = [];
+    const mergeCommits: string[] = [];
+    const integrations = Object.values(this.state.integrations).filter((record) =>
+      record.base === approved.commit && record.target === approved.branch && record.commit &&
+      record.check?.passed && record.conflicts.length === 0 && record.taskIds.length > 1 &&
+      record.taskIds.every((id) => task.dependsOn.includes(id) && dependencies[id])).sort((a, b) => b.taskIds.length - a.taskIds.length);
+    for (const integration of integrations) {
+      if (integration.taskIds.some((id) => covered.has(id))) continue;
+      integrationIds.push(integration.id);
+      mergeCommits.push(integration.commit!);
+      for (const id of integration.taskIds) covered.add(id);
+    }
+    for (const id of task.dependsOn) if (!covered.has(id)) mergeCommits.push(dependencies[id]);
     const id = randomUUID();
     const branch = `orch/task-${task.id}-${id}`;
     const path = join(this.project, ".orch", "worktrees", `task-${task.id}-${id}`);
     await mkdir(join(this.project, ".orch", "worktrees"), { recursive: true });
     await this.git(this.project, "worktree", "add", "-b", branch, path, approved.commit);
     try {
-      for (const [dependency, commit] of Object.entries(dependencies)) {
-        await this.git(path, "-c", "user.name=Orch", "-c", "user.email=orch@localhost", "merge", "--no-ff", "-m", `Integrate ${dependency}`, commit);
+      for (const [index, commit] of [...new Set(mergeCommits)].entries()) {
+        await this.git(path, "-c", "user.name=Orch", "-c", "user.email=orch@localhost", "merge", "--no-ff", "-m", `Integrate dependency base ${index + 1}`, commit);
       }
     } catch (error) {
       await this.git(path, "merge", "--abort").catch(() => undefined);
@@ -100,7 +114,7 @@ export class WorktreeManager {
         await cp(generated, destination, { recursive: true });
       } catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error; }
       const record: WorkerRecord = { taskId: task.id, branch, path, approvedBase: approved.commit, targetBranch: approved.branch,
-        base: await this.git(path, "rev-parse", "HEAD"), dependencies,
+        base: await this.git(path, "rev-parse", "HEAD"), dependencies, integrationIds,
         contextDocuments: state.project.value.context?.documents ?? [], lessonIds };
       this.state.workers[task.id] = record;
       await this.save();
@@ -178,6 +192,45 @@ export class WorktreeManager {
       const action = await this.service.execute({ version: 1, kind: "action.request", expectedRevision: await this.service.revision(),
         payload: { target: "merge", destination: approved.branch, artifactRevision: integration.commit, baseRevision: approved.commit } });
       integration.actionId = action.subjectId;
+    }
+    await this.save();
+    return integration;
+  }
+  async verifyIntegration(id: string, checkCommand: string): Promise<IntegrationRecord> {
+    if (!checkCommand.trim()) throw new Error("Integration needs a validation command");
+    const integration = this.state.integrations[id];
+    if (!integration) throw new Error(`Unknown integration: ${id}`);
+    const approved = await this.approvedBase();
+    if (integration.base !== approved.commit || integration.target !== approved.branch) throw new Error("Integration belongs to a different approved base");
+    if (await this.git(integration.path, "symbolic-ref", "--short", "HEAD") !== integration.branch) throw new Error("Integration branch changed");
+    if (await this.git(integration.path, "diff", "--name-only", "--diff-filter=U")) throw new Error("Resolve all integration conflicts before verification");
+    if (await this.git(integration.path, "status", "--porcelain", "--untracked-files=no")) throw new Error("Commit the resolved integration before verification");
+    const head = await this.git(integration.path, "rev-parse", "HEAD");
+    for (const taskId of integration.taskIds) {
+      const worker = this.state.workers[taskId];
+      if (!worker?.validation?.passed || !worker.commit || worker.approvedBase !== approved.commit) throw new Error(`Task ${taskId} has no validated commit for this base`);
+      try { await this.git(integration.path, "merge-base", "--is-ancestor", worker.commit, head); }
+      catch { throw new Error(`Resolved integration does not include ${taskId}`); }
+    }
+    const check = await new Promise<{ passed: boolean; output: string }>((done) => {
+      const child = spawn(checkCommand, { cwd: integration.path, shell: true, windowsHide: true, timeout: 600_000 });
+      let output = "";
+      for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: Buffer) => { output = (output + chunk.toString()).slice(-8192); });
+      child.on("error", (error: Error) => { output = (output + error.message).slice(-8192); });
+      child.on("close", (code: number | null) => done({ passed: code === 0, output }));
+    });
+    const changed = await this.git(integration.path, "status", "--porcelain", "--untracked-files=no");
+    integration.check = { command: checkCommand, passed: check.passed && !changed,
+      output: changed ? `${check.output}\nIntegration check changed tracked files: ${changed}`.trim() : check.output };
+    if (integration.check.passed) {
+      integration.conflicts = [];
+      integration.commit = head;
+      integration.diff = await this.git(integration.path, "diff", `${approved.commit}..HEAD`, "--");
+      if (!integration.actionId) {
+        const action = await this.service.execute({ version: 1, kind: "action.request", expectedRevision: await this.service.revision(),
+          payload: { target: "merge", destination: approved.branch, artifactRevision: head, baseRevision: approved.commit } });
+        integration.actionId = action.subjectId;
+      }
     }
     await this.save();
     return integration;

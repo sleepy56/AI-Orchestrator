@@ -250,6 +250,7 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.equal(cli(project, home, "init", "--docs", "README.md").status, 0);
   assert.equal(cli(project, home, "plan", "Change shared left").status, 0);
   assert.equal(cli(project, home, "plan", "Change shared right").status, 0);
+  assert.equal(cli(project, home, "plan", "Build on both", "--after", "TASK-001,TASK-002").status, 0);
   assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
   const tasks = (await new CommandService(project).detail()).tasks.map((entry) => entry.spec);
   const manager = await new WorktreeManager(project).load();
@@ -267,10 +268,25 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.deepEqual(detail.workers[tasks[0].id].lessonIds, ["lesson-left"]);
   assert.equal(detail.workers[tasks[0].id].contextId, "thread-left");
   assert.equal(detail.workers[tasks[1].id].contextId, "thread-right");
-  const integrated = await manager.integrate(tasks.map((task) => task.id), "node -e \"process.exit(0)\"");
+  const integrated = await manager.integrate(tasks.slice(0, 2).map((task) => task.id), "node -e \"process.exit(0)\"");
   assert.deepEqual(integrated.conflicts, ["shared.txt"]);
   assert.match(integrated.diff, /left|right/);
   assert.equal(integrated.actionId, undefined);
+  assert.equal(git("rev-parse", "main"), base);
+  await assert.rejects(manager.verifyIntegration(integrated.id, "node -e \"process.exit(0)\""), /Resolve all integration conflicts/);
+  await writeFile(join(integrated.path, "shared.txt"), "left and right\n");
+  git("-C", integrated.path, "add", "shared.txt");
+  git("-C", integrated.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Resolve integration");
+  const verified = await manager.verifyIntegration(integrated.id,
+    "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').includes('left and right')?0:1)\"");
+  assert.deepEqual(verified.conflicts, []);
+  assert.equal(verified.check?.passed, true, verified.check?.output);
+  assert.ok(verified.actionId);
+  const dependent = await manager.prepare(tasks[2]);
+  assert.deepEqual(dependent.integrationIds, [integrated.id]);
+  assert.deepEqual(dependent.dependencies, { "TASK-001": detail.workers[tasks[0].id].commit, "TASK-002": detail.workers[tasks[1].id].commit });
+  assert.equal((await readFile(join(dependent.path, "shared.txt"), "utf8")).trim(), "left and right");
+  assert.equal(git("-C", dependent.path, "merge-base", "--is-ancestor", verified.commit!, dependent.base), "");
   assert.equal(git("rev-parse", "main"), base);
 }));
 

@@ -56,6 +56,7 @@ function usage(): string {
     "  orch worktrees base <branch> <commit> [--project directory]",
     "  orch worktrees show [--project directory]",
     "  orch worktrees integrate TASK-001,TASK-002 --check 'npm test' [--project directory]",
+    "  orch worktrees verify <integration-id> --check 'npm test' [--project directory]  (after resolving and committing conflicts)",
     "  orch worktrees merge <approved-action-id> [--project directory]",
     "  orch actions request merge|deployment <destination> <artifact-revision> [--base-revision TARGET-HEAD] [--id ACTION-ID] [--project directory]",
     "  orch actions show|approve|ready <action-id> [--project directory]",
@@ -344,11 +345,15 @@ async function worktrees(args: string[]): Promise<void> {
     if (positionals.length !== 1 || !option(options, "check")) throw new Error("worktrees integrate needs comma-separated task IDs and --check");
     const result = await manager.integrate(positionals[0].split(","), option(options, "check")!);
     console.log(JSON.stringify(result, null, 2));
+  } else if (operation === "verify") {
+    if (positionals.length !== 1 || !option(options, "check")) throw new Error("worktrees verify needs one integration ID and --check");
+    const result = await manager.verifyIntegration(positionals[0], option(options, "check")!);
+    console.log(JSON.stringify(result, null, 2));
   } else if (operation === "merge") {
     if (positionals.length !== 1 || option(options, "check")) throw new Error("worktrees merge needs one approved action ID");
     const result = await manager.merge(positionals[0]);
     console.log(`Merged ${result.commit} into ${result.target}`);
-  } else throw new Error("Use orch worktrees base|show|integrate|merge");
+  } else throw new Error("Use orch worktrees base|show|integrate|verify|merge");
 }
 
 function printChecks(report: Awaited<ReturnType<typeof checkReport>>): void {
