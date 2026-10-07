@@ -16,11 +16,13 @@ import { smokeCodex } from "./providers";
 import { routeReason, routeTask } from "./router";
 import { readRunEvents, RunEventWriter } from "./run-events";
 import { TaskGraph } from "./scheduler";
-import { Difficulty, Risk, TaskSnapshot, TaskType } from "./types";
+import { Difficulty, Risk, Route, TaskSnapshot, TaskSpec, TaskType } from "./types";
 import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
 import { CapacityScheduler, capacityAvailability, readCapacity } from "./capacity";
 import { PostgresMetadata } from "./postgres-metadata";
 import { localSharedSnapshot } from "./shared-metadata";
+import { constrainProposal, resolveRoute } from "./routing-policy";
+import { nextRoute } from "./escalation";
 
 type Options = Record<string, string | boolean>;
 
@@ -63,6 +65,10 @@ function usage(): string {
     "  orch doctor codex [--project directory] [--timeout-seconds 60]",
     "  orch models list|add|enable|disable|weight ... [--project directory]",
     "  orch models recommend TASK-001 --prices snapshot.json [--manual-alias alias] [--project directory]",
+    "  orch models limits --file limits.json --reason text [--project directory]",
+    "  orch models apply TASK-001 [--project directory]  (use .orch/prices.json and live outcomes)",
+    "  orch models policy [--project directory]  (rules, limits, and versioned history)",
+    "  orch models rollback VERSION --reason text [--project directory]",
     "  orch knowledge add <note> [--type rename|refactor|analysis|test|other] [--project directory]",
     "  orch knowledge list [--scope project|global] [--project directory]",
     "  orch knowledge review <id> --status pending|approved|rejected [--project directory]  (approving a candidate creates a reviewed lesson)",
@@ -460,7 +466,18 @@ async function runUnlocked(args: string[]): Promise<number> {
   }
   const knowledge = new KnowledgeStore(project);
   const registry = await loadRegistry(project);
-  const scheduler = mode === "codex" ? await CapacityScheduler.load(project, registry) : undefined;
+  const policyVersion = Math.max(registry.policyVersion ?? 1, planning.policy.revision);
+  const startedPolicy = priorEvents.find((event) => event.type === "run.started");
+  if (mode === "codex" && startedPolicy?.type === "run.started" && startedPolicy.policyVersion !== policyVersion)
+    throw new Error("Routing policy changed since this run started; start a new run with the current policy");
+  const routing = planning.policy.value.routing ?? { limits: {}, rules: {} };
+  const observed = mode === "codex" ? (await knowledge.list("project")).filter((entry) => entry.kind === "attempt") : [];
+  let prices: PriceSnapshot | undefined;
+  try { prices = JSON.parse(await readFile(join(project, ".orch", "prices.json"), "utf8")) as PriceSnapshot; }
+  catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error; }
+  const resolved = (task: TaskSpec, route: Route, attempt: number) => resolveRoute(task, route, attempt, routing, registry, observed, prices);
+  const scheduler = mode === "codex" ? await CapacityScheduler.load(project, registry, (task) => resolved(task, routeTask(task), 1).profile,
+    routing.limits.maxCostPerTaskUsd) : undefined;
   if (unfinished.length) {
     const workers = mode === "codex" ? (await new WorktreeManager(project).load()).detail() : undefined;
     const records = workers ? (await workers).workers : {};
@@ -496,9 +513,8 @@ async function runUnlocked(args: string[]): Promise<number> {
       const drafted = planning.plan.value.draft?.tasks.find((item) => item.id === task.id);
       return drafted ? [`Acceptance criteria: ${drafted.acceptanceCriteria.join("; ")}.`,
         `Relevant areas: ${drafted.areas.join(", ")}.`, `Required context: ${drafted.context.join(", ")}.`] : [];
-    });
+    }, (task, route, attempt) => resolved(task, route, attempt).profile);
   await ensureProjectIgnore(project);
-  const policyVersion = registry.policyVersion ?? 1;
   await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
     payload: { runId: events.runId, status: "running", mode: mode === "fake" ? "simulated" : "live" } });
   await events.append(priorEvents.some((event) => event.type === "run.started") ? { type: "run.resumed" } : { type: "run.started", mode: mode === "fake" ? "simulated" : "live", tasks: graph.snapshot().tasks, policyVersion });
@@ -517,7 +533,16 @@ async function runUnlocked(args: string[]): Promise<number> {
   }, {
     maxTasks: options.once === true ? 1 : undefined,
     capacity: scheduler ? (task, inFlight) => scheduler.decide(task, inFlight) : undefined,
-    beforeTask: async () => mode === "codex" ? worktreeBaseGate(await commands.detail()) : executionGate(await commands.detail()),
+    beforeTask: async () => {
+      const current = await commands.detail();
+      if (mode === "codex" && current.policy.revision !== planning.policy.revision) return "Routing policy changed; resume with the current version";
+      return mode === "codex" ? worktreeBaseGate(current) : executionGate(current);
+    },
+    initialRoute: mode === "codex" ? (task) => resolved(task, routeTask(task), 1).route : undefined,
+    retryRoute: mode === "codex" ? (task, initial, failed) => {
+      const established = routeTask(task);
+      return initial.label !== established.label ? (failed === 1 ? established : null) : nextRoute(initial, failed);
+    } : undefined,
     onEvent: async (event) => {
       await events.append(event);
       if (mode === "codex" && event.type === "task.started") {
@@ -526,16 +551,26 @@ async function runUnlocked(args: string[]): Promise<number> {
       }
     }, simulated: mode === "fake",
     routeDecision: (task, route, attempt) => {
+      const rule = routing.rules[`${task.type}:${task.difficulty}:${task.risk}`];
+      const evidenceRevision = rule && attempt === 1 ? (planning.policy.value.history ?? []).slice().reverse().find((item) =>
+        item.cause === "live-outcomes" && item.candidate?.alias === rule.alias && item.baseline?.alias === rule.fallbackAlias) : undefined;
       const candidates = registry.models.filter((model) => model.provider === "codex" && model.enabled && model.tier === route.label)
         .sort((a, b) => b.weight - a.weight || a.alias.localeCompare(b.alias));
       let chosen: ModelProfile | undefined;
+      let fallbackAlias: string | undefined;
+      let constraint: string | undefined;
       if (mode === "codex") {
-        try { chosen = selectModel(registry, route); } catch { /* The attempt records the provider error. */ }
+        try { const decision = resolved(task, route, attempt); chosen = decision.profile; fallbackAlias = decision.fallbackAlias; constraint = decision.constraint; }
+        catch { /* The attempt records the provider error. */ }
       }
       return {
-        type: "route.decided", taskId: task.id, attempt, route, reason: routeReason(task), policyVersion,
+        type: "route.decided", taskId: task.id, attempt, route,
+        reason: evidenceRevision?.reason ?? routeReason(task), policyVersion,
         candidates: candidates.map((model) => ({ alias: model.alias, model: model.model, weight: model.weight })),
         ...(chosen ? { chosenAlias: chosen.alias, chosenModel: `${chosen.provider}:${chosen.model}`, preferenceWeight: chosen.weight } : {}),
+        ...(fallbackAlias ? { fallbackAlias } : {}), ...(constraint ? { constraint } : {}),
+        userLimits: routing.limits,
+        observedEvidenceIds: evidenceRevision?.evidenceIds ?? [],
       };
     },
   });
@@ -590,11 +625,39 @@ async function doctor(args: string[]): Promise<number> {
 async function models(args: string[]): Promise<void> {
   const [action, ...rest] = args;
   const allowed = action === "add" ? ["project", "provider", "model", "tier", "effort", "weight", "enable"]
-    : action === "recommend" ? ["project", "prices", "manual-alias"] : ["project"];
+    : action === "recommend" ? ["project", "prices", "manual-alias"]
+      : action === "limits" ? ["project", "file", "reason"]
+        : action === "rollback" ? ["project", "reason"] : ["project"];
   const { positionals, options } = parseArguments(rest, allowed);
   const project = resolve(option(options, "project") ?? process.cwd());
   await loadGraph(project);
   const registry = await loadRegistry(project);
+  if (action === "policy") {
+    if (positionals.length) throw new Error("models policy takes no arguments");
+    const policy = (await new CommandService(project).detail()).policy;
+    console.log(JSON.stringify({ version: policy.revision, routing: policy.value.routing ?? { limits: {}, rules: {} }, history: policy.value.history ?? [] }, null, 2));
+    return;
+  }
+  if (action === "limits" || action === "apply" || action === "rollback") {
+    const service = new CommandService(project);
+    let kind: Command["kind"];
+    let payload: Record<string, unknown>;
+    if (action === "limits") {
+      if (positionals.length || !option(options, "file")) throw new Error("models limits needs --file");
+      kind = "policy.limits";
+      payload = { actor: "user", limits: JSON.parse(await readFile(resolve(option(options, "file")!), "utf8")), reason: option(options, "reason") ?? "User routing limits" };
+    } else if (action === "apply") {
+      if (positionals.length !== 1) throw new Error("models apply needs one task ID");
+      kind = "policy.route"; payload = { taskId: positionals[0] };
+    } else {
+      if (positionals.length !== 1) throw new Error("models rollback needs a version");
+      kind = "policy.rollback"; payload = { targetVersion: Number(positionals[0]), actor: "user", reason: option(options, "reason") ?? `Restore routing version ${positionals[0]}` };
+    }
+    await service.execute({ version: 1, kind, expectedRevision: await service.revision(), payload });
+    const policy = (await service.detail()).policy;
+    console.log(JSON.stringify({ version: policy.revision, routing: policy.value.routing, revision: policy.value.history?.at(-1) }, null, 2));
+    return;
+  }
   if (action === "recommend") {
     if (positionals.length !== 1) throw new Error("models recommend needs one task ID");
     const task = (await loadGraph(project)).snapshot().tasks.find((record) => record.spec.id === positionals[0])?.spec;
@@ -602,8 +665,10 @@ async function models(args: string[]): Promise<void> {
     const priceFile = option(options, "prices");
     const prices = priceFile ? JSON.parse(await readFile(resolve(priceFile), "utf8")) as PriceSnapshot : undefined;
     const attempts = (await new KnowledgeStore(project).list("project")).filter((entry) => entry.kind === "attempt");
-    console.log(JSON.stringify(recommendModelRoute({ task, registry, attempts, prices,
-      manualAlias: option(options, "manual-alias") }), null, 2));
+    const proposal = recommendModelRoute({ task, registry, attempts, prices,
+      manualAlias: option(options, "manual-alias") });
+    const routing = (await new CommandService(project).detail()).policy.value.routing ?? { limits: {}, rules: {} };
+    console.log(JSON.stringify(constrainProposal(proposal, task, routing, registry, attempts, prices), null, 2));
     return;
   }
   if (action === "list") {
@@ -634,7 +699,7 @@ async function models(args: string[]): Promise<void> {
     await service.execute({ version: 1, kind: "policy.model", expectedRevision: await service.revision(),
       payload: { action, alias: item.alias, ...(action === "weight" ? { weight: positionals[1] } : {}) } });
   } else {
-    throw new Error("Use orch models list|add|enable|disable|weight|recommend");
+    throw new Error("Use orch models list|add|enable|disable|weight|recommend|limits|apply|policy|rollback");
   }
   console.log("Updated model registry.");
 }

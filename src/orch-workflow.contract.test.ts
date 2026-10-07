@@ -20,6 +20,8 @@ import { CapacityScheduler, readCapacity } from "./capacity";
 import { readRunEvents } from "./run-events";
 import { localSharedSnapshot, validateSharedSnapshot } from "./shared-metadata";
 import { PostgresMetadata } from "./postgres-metadata";
+import { resolveRoute } from "./routing-policy";
+import { recommendModelRoute } from "./model-decisions";
 
 test("[TASK-022] a provider capacity failure defers its task instead of failing it", async () => {
   const task: TaskSpec = { id: "TASK-001", description: "Rename a symbol", type: "rename", difficulty: "easy", risk: "low", dependsOn: [] };
@@ -957,4 +959,143 @@ test("[TASK-023] fresh Docker Postgres migrates and round-trips allowed run meta
     const stopped = docker("down", "-v");
     assert.equal(stopped.status, 0, stopped.stderr);
   }
+}));
+
+test("[TASK-024] live route evidence creates a versioned policy, user limits override it, and rollback restores the earlier route", async () => fixture(async (project, other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Analyze a route", "--type", "analysis", "--difficulty", "moderate", "--risk", "medium").status, 0);
+  const task = new TaskGraph(JSON.parse(await readFile(join(project, ".orch", "tasks.json"), "utf8"))).ready()[0];
+  const registry = await loadRegistry(project);
+  const store = new KnowledgeStore(project, home);
+  const price = { version: "known-2026-01", currency: "USD", models: {
+    "codex:gpt-6-sol": { inputPerMillion: 10, outputPerMillion: 20 },
+    "codex:gpt-6-luna": { inputPerMillion: 1, outputPerMillion: 2 },
+  } };
+  await writeFile(join(project, ".orch", "prices.json"), JSON.stringify(price));
+  for (const route of ["sol-medium", "luna-medium"] as const) for (let index = 0; index < 8; index++) {
+    const model = route === "sol-medium" ? "codex:gpt-6-sol" : "codex:gpt-6-luna";
+    const base = { kind: "attempt" as const, scope: "project" as const, sourceProject: "fixture", sourceRunId: `${route}-${index}`,
+      at: "2026-01-01T00:00:00.000Z", taskId: `HIST-${route}-${index}`, taskType: "analysis" as const,
+      difficulty: "moderate" as const, risk: "medium" as const, route, model, simulated: false,
+      inputTokens: 1000, outputTokens: 100, latencyMs: 1000, errors: [] as string[] };
+    await store.append("project", { ...base, id: `${route}-${index}-1`, attemptNumber: 1,
+      passed: route === "sol-medium" || index !== 0 } as AttemptEntry);
+    if (route === "luna-medium" && index === 0) await store.append("project", { ...base, id: `${route}-${index}-2`, attemptNumber: 2,
+      passed: true } as AttemptEntry);
+  }
+  await store.append("project", { kind: "attempt", id: "simulated-cheap", scope: "project", sourceProject: "fixture", sourceRunId: "fake",
+    at: "2026-01-01T00:00:00.000Z", taskId: "FAKE", attemptNumber: 1, taskType: "analysis", difficulty: "moderate", risk: "medium",
+    route: "luna-medium", model: "codex:gpt-6-luna", passed: true, errors: [], simulated: true,
+    inputTokens: 1, outputTokens: 1, latencyMs: 1 } as AttemptEntry);
+  const attempts = (await store.list("project")).filter((entry): entry is AttemptEntry => entry.kind === "attempt");
+  const proposal = recommendModelRoute({ task, registry, attempts, prices: price });
+  assert.equal(proposal.recommendedAlias, "luna-medium");
+  assert.equal(proposal.candidate?.taskCount, 8);
+  assert.equal(proposal.candidate?.attemptCount, 9);
+  assert.equal(proposal.candidate?.retries, 1);
+  assert.equal(proposal.candidate?.averageLatencyMs, 1125);
+  assert.equal(proposal.candidate?.evidenceIds.includes("simulated-cheap"), false);
+
+  const limitsPath = join(project, "limits.json");
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], maxCostPerTaskUsd: 0.0005 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Budget").status, 0);
+  assert.match(JSON.parse(cli(project, home, "models", "recommend", task.id, "--prices", join(project, ".orch", "prices.json")).stdout).reason, /rejected by user limits/);
+  const rejected = cli(project, home, "models", "apply", task.id);
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /violates user limits/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], maxCostPerTaskUsd: 0.02 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Approved budget").status, 0);
+  const applied = cli(project, home, "models", "apply", task.id);
+  assert.equal(applied.status, 0, applied.stderr);
+  const service = new CommandService(project);
+  const active = (await service.detail()).policy;
+  const revision = active.value.history?.at(-1);
+  assert.equal(revision?.author, "orch");
+  assert.equal(revision?.cause, "live-outcomes");
+  assert.equal(revision?.priceVersion, "known-2026-01");
+  assert.equal(revision?.evidenceIds.length, 17);
+  assert.equal(revision?.candidate?.retries, 1);
+  assert.equal(revision?.rollbackTo, active.revision - 1);
+  assert.equal(resolveRoute(task, routeTask(task), 1, active.value.routing!, registry, attempts, price).profile.alias, "luna-medium");
+  const unavailable = structuredClone(registry);
+  unavailable.models.find((profile) => profile.alias === "luna-medium")!.enabled = false;
+  assert.equal(resolveRoute(task, routeTask(task), 1, active.value.routing!, unavailable, attempts, price).profile.alias, "sol-medium");
+  const worker = new FakeExecutor({ [task.id]: ["fail", "pass"] });
+  await orchestrate(TaskGraph.fromSpecs([task]), worker, undefined, {
+    initialRoute: (item) => resolveRoute(item, routeTask(item), 1, active.value.routing!, registry, attempts, price).route,
+    retryRoute: (item, initial, failed) => initial.label !== routeTask(item).label && failed === 1 ? routeTask(item) : null,
+  });
+  assert.deepEqual(worker.calls.map((call) => call.route), ["luna-medium", "sol-medium"]);
+  assert.match(cli(project, home, "models", "policy").stdout, /"rollbackTo"/);
+  assert.doesNotMatch(JSON.stringify(await service.sharedView()), /HIST-|known-2026|routing|evidenceIds/);
+
+  const note = await store.note("project", "Analysis route guidance from reviewed lessons", "analysis");
+  await store.review(note.id, "approved");
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\nlimits.json\n");
+  await writeFile(join(project, "README.md"), "Worker fixture\n");
+  git("add", ".gitignore", "README.md");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  assert.equal(cli(project, home, "worktrees", "base", "main", git("rev-parse", "HEAD")).status, 0);
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const capture = join(other, "capture.json");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, [
+    "const fs = require('node:fs');",
+    "fs.writeFileSync('routed.txt', 'done');",
+    "fs.writeFileSync(process.env.ORCH_CAPTURE, JSON.stringify(process.argv.slice(2)));",
+    "console.log(JSON.stringify({type:'thread.started',thread_id:'route-context'}));",
+    "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));",
+    "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1000,output_tokens:100}}));",
+  ].join("\n"));
+  await writeFile(join(bin, "codex.cmd"), "rem fake Codex launcher\n");
+  const unixLauncher = join(bin, "codex");
+  await writeFile(unixLauncher, `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(unixLauncher, 0o755);
+  const path = process.platform === "win32"
+    ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const live = spawnSync(process.execPath, [join(__dirname, "cli.js"), "run", "--executor", "codex", "--check", "node -e \"process.exit(0)\""], {
+    cwd: project, encoding: "utf8", timeout: 30_000, env: { ...process.env, ORCH_HOME: home, ORCH_CAPTURE: capture, PATH: path },
+  });
+  assert.equal(live.status, 0, live.stderr || live.stdout);
+  const argv = JSON.parse(await readFile(capture, "utf8")) as string[];
+  assert.equal(argv[argv.indexOf("-m") + 1], "gpt-6-luna");
+  assert.match(argv.at(-1) ?? "", /Analysis route guidance from reviewed lessons/);
+  assert.doesNotMatch(argv.at(-1) ?? "", /sol-medium-0-1|luna-medium-0-1/);
+  const events = await readRunEvents(project);
+  const routeEvent = events.find((event) => event.type === "route.decided");
+  const usedEvent = events.find((event) => event.type === "knowledge.selected");
+  assert.ok(routeEvent?.type === "route.decided" && usedEvent?.type === "knowledge.selected");
+  assert.equal(routeEvent.chosenAlias, "luna-medium");
+  assert.equal(routeEvent.fallbackAlias, "sol-medium");
+  assert.equal(routeEvent.observedEvidenceIds?.length, 17);
+  assert.deepEqual(usedEvent.lessonIds, [note.id]);
+  assert.equal(routeEvent.observedEvidenceIds?.includes(note.id), false);
+  assert.equal(usedEvent.lessonIds.some((id) => routeEvent.observedEvidenceIds?.includes(id)), false);
+
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], blockedModels: ["luna-medium"], maxCostPerTaskUsd: 0.02 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Block Luna").status, 0);
+  const constrained = (await service.detail()).policy;
+  const fallback = resolveRoute(task, routeTask(task), 1, constrained.value.routing!, registry, attempts, price);
+  assert.equal(fallback.profile.alias, "sol-medium");
+  assert.match(fallback.constraint ?? "", /blocked/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["claude"] }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Provider limit").status, 0);
+  await assert.rejects(async () => resolveRoute(task, routeTask(task), 1, (await service.detail()).policy.value.routing!, registry, attempts, price), /No permitted model route/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], blockedModels: ["luna-medium"] }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Restore Codex").status, 0);
+  const rolled = cli(project, home, "models", "rollback", "0", "--reason", "Restore established route");
+  assert.equal(rolled.status, 0, rolled.stderr);
+  const restored = (await service.detail()).policy;
+  assert.deepEqual(restored.value.routing?.rules, {});
+  assert.deepEqual(restored.value.routing?.limits.blockedModels, ["luna-medium"]);
+  assert.equal(restored.value.history?.at(-1)?.cause, "rollback");
+  assert.equal(resolveRoute(task, routeTask(task), 1, restored.value.routing!, registry, attempts, price).profile.alias, "sol-medium");
 }));

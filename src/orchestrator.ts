@@ -20,6 +20,8 @@ export interface RunOptions {
   onEvent?: (event: RunEventData) => Promise<void> | void;
   simulated?: boolean;
   routeDecision?: (task: TaskSpec, route: Route, attempt: number) => RunEventData;
+  initialRoute?: (task: TaskSpec) => Route;
+  retryRoute?: (task: TaskSpec, initial: Route, failedAttempts: number) => Route | null;
   beforeTask?: () => Promise<string | undefined> | string | undefined;
   capacity?: (task: TaskSpec, inFlight: TaskSpec[]) => Promise<CapacityDecision>;
 }
@@ -55,7 +57,7 @@ export async function orchestrate(
     }
     if (!wave.length) break;
     batches.push(wave.map((task) => task.id));
-    const results = await Promise.all(wave.map((task) => runTask(task, executor, graph.get(task.id).attempts.length, options.onEvent, options.simulated ?? false, options.routeDecision)));
+    const results = await Promise.all(wave.map((task) => runTask(task, executor, graph.get(task.id).attempts.length, options.onEvent, options.simulated ?? false, options.routeDecision, options.initialRoute, options.retryRoute)));
     for (const result of results) {
       if (result.pausedReason) {
         graph.defer(result.id, result.attempts);
@@ -86,9 +88,11 @@ async function runTask(
   onEvent?: (event: RunEventData) => Promise<void> | void,
   simulated = false,
   routeDecision?: (task: TaskSpec, route: Route, attempt: number) => RunEventData,
+  initialRoute?: (task: TaskSpec) => Route,
+  retryRoute?: (task: TaskSpec, initial: Route, failedAttempts: number) => Route | null,
 ): Promise<{ id: string; attempts: AttemptRecord[]; passed: boolean; pausedReason?: string }> {
   const attempts: AttemptRecord[] = [];
-  const initial = routeTask(task);
+  const initial = initialRoute?.(task) ?? routeTask(task);
   let route = initial;
 
   while (true) {
@@ -127,7 +131,7 @@ async function runTask(
     if (execution?.capacityReason) return { id: task.id, attempts, passed: false, pausedReason: execution.capacityReason };
     if (validation.passed) return { id: task.id, attempts, passed: true };
     if (fatal || execution?.retryable === false) return { id: task.id, attempts, passed: false };
-    const escalation = nextRoute(initial, attempts.length);
+    const escalation = retryRoute?.(task, initial, attempts.length) ?? (retryRoute ? null : nextRoute(initial, attempts.length));
     if (!escalation) return { id: task.id, attempts, passed: false };
     route = escalation;
   }

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { Executor } from "./executor";
-import { ModelRegistry, selectModel } from "./models";
+import { ModelProfile, ModelRegistry, selectModel } from "./models";
 import { ExecutionResult, Route, TaskSpec } from "./types";
 import { access } from "node:fs/promises";
 import { delimiter, join } from "node:path";
@@ -36,13 +36,14 @@ export class CodexExecutor implements Executor {
     private readonly timeoutMs = 600_000,
     private readonly onPrompt?: (task: TaskSpec) => Promise<void> | void,
     private readonly contextForTask: (task: TaskSpec) => string[] = () => [],
+    private readonly profileForTask?: (task: TaskSpec, route: Route, attempt: number) => ModelProfile,
   ) {
     if (!checkCommand.trim()) throw new Error("Live Codex runs require --check with a project validation command");
   }
 
   async execute(task: TaskSpec, route: Route, attempt: number): Promise<ExecutionResult> {
     let profile;
-    try { profile = selectModel(this.registry, route); }
+    try { profile = this.profileForTask?.(task, route, attempt) ?? selectModel(this.registry, route); }
     catch (error) { throw new ProviderConfigurationError(error instanceof Error ? error.message : String(error)); }
     const started = Date.now();
     console.log(`${task.id}: Codex ${profile.model} (${profile.effort}), attempt ${attempt}`);

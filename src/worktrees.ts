@@ -7,7 +7,7 @@ import { CommandService, worktreeBaseGate } from "./command-service";
 import { TaskSpec } from "./types";
 import { Executor } from "./executor";
 import { CodexExecutor } from "./providers";
-import { ModelRegistry } from "./models";
+import { ModelProfile, ModelRegistry } from "./models";
 import { ExecutionResult, Route } from "./types";
 import { runCheck } from "./checks";
 
@@ -257,7 +257,8 @@ export class WorktreeCodexExecutor implements Executor {
   constructor(private readonly manager: WorktreeManager, private readonly registry: ModelRegistry,
     private readonly checkCommand: string, private readonly lessons: (task: TaskSpec) => { ids: string[]; text: string[] },
     private readonly timeoutMs: number, private readonly onPrompt: (task: TaskSpec) => Promise<void> | void,
-    private readonly taskContext: (task: TaskSpec) => string[] = () => []) {}
+    private readonly taskContext: (task: TaskSpec) => string[] = () => [],
+    private readonly profileForTask?: (task: TaskSpec, route: Route, attempt: number) => ModelProfile) {}
   async execute(task: TaskSpec, route: Route, attempt: number): Promise<ExecutionResult> {
     const lessons = this.lessons(task);
     const resumingWorktree = Boolean((await this.manager.detail()).workers[task.id]);
@@ -270,7 +271,7 @@ export class WorktreeCodexExecutor implements Executor {
       ...this.taskContext(task),
     ];
     const executor = new CodexExecutor(record.path, this.registry, this.checkCommand, () => lessons.text,
-      this.timeoutMs, async (started) => { await this.manager.markPrompt(task.id, lessons.ids); await this.onPrompt(started); }, () => context);
+      this.timeoutMs, async (started) => { await this.manager.markPrompt(task.id, lessons.ids); await this.onPrompt(started); }, () => context, this.profileForTask);
     const result = await executor.execute(task, route, attempt);
     if (result.capacityReason) return { ...result, worktree: record.path };
     const service = new CommandService(this.manager.projectPath);

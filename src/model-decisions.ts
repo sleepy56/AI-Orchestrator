@@ -23,6 +23,7 @@ export interface RouteEvidence {
   averageOutputTokens: number;
   averageLatencyMs: number;
   averageCostPerTask: number;
+  maximumObservedCostPerTask: number;
   evidenceIds: string[];
 }
 
@@ -76,7 +77,7 @@ function wilson95(passed: number, total: number): [number, number] {
   return [Math.max(0, middle - margin), Math.min(1, middle + margin)];
 }
 
-function evidence(profile: ModelProfile, input: RouteProposalInput): RouteEvidence | undefined {
+export function routeEvidence(profile: ModelProfile, input: RouteProposalInput): RouteEvidence | undefined {
   const price = priceFor(input.prices, profile);
   if (!price) return undefined;
   const groups = new Map<string, Observation[]>();
@@ -101,6 +102,8 @@ function evidence(profile: ModelProfile, input: RouteProposalInput): RouteEviden
   const inputTokens = rows.reduce((sum, row) => sum + row.inputTokens!, 0);
   const outputTokens = rows.reduce((sum, row) => sum + row.outputTokens!, 0);
   const latency = rows.reduce((sum, row) => sum + row.latencyMs!, 0);
+  const maximumObservedCostPerTask = Math.max(...[...groups.values()].map((group) => group.reduce((sum, row) =>
+    sum + (row.inputTokens! * price.inputPerMillion + row.outputTokens! * price.outputPerMillion) / 1_000_000, 0)));
   return {
     alias: profile.alias, model: `${profile.provider}:${profile.model}`, route: profile.tier,
     taskCount: groups.size, attemptCount: rows.length, validatedPasses: passed,
@@ -108,6 +111,7 @@ function evidence(profile: ModelProfile, input: RouteProposalInput): RouteEviden
     averageInputTokens: inputTokens / groups.size, averageOutputTokens: outputTokens / groups.size,
     averageLatencyMs: latency / groups.size,
     averageCostPerTask: (inputTokens * price.inputPerMillion + outputTokens * price.outputPerMillion) / (1_000_000 * groups.size),
+    maximumObservedCostPerTask,
     evidenceIds: rows.map((row) => row.id).filter((id): id is string => Boolean(id)),
   };
 }
@@ -127,14 +131,14 @@ export function recommendModelRoute(input: RouteProposalInput): RouteProposal {
     result.reason = "Manual model override retained; automatic route proposals do not replace it.";
     return result;
   }
-  const baseline = evidence(fallback, input);
+  const baseline = routeEvidence(fallback, input);
   if (!baseline) return result;
   result.baseline = baseline;
   result.priceVersion = input.prices!.version;
   result.currency = input.prices!.currency;
   const alternatives = input.registry.models.filter((profile) => profile.enabled && profile.provider === "codex" &&
     (profile.tier !== fallback.tier || profile.model !== fallback.model))
-    .map((profile) => evidence(profile, input)).filter((item): item is RouteEvidence => Boolean(item))
+    .map((profile) => routeEvidence(profile, input)).filter((item): item is RouteEvidence => Boolean(item))
     // A candidate failure may incur a later fallback on another route. That cost
     // is not attributable from route-only evidence, so require every observed
     // candidate task to have a validated pass on this route.
