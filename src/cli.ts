@@ -20,6 +20,7 @@ import { Difficulty, Risk, Route, TaskSnapshot, TaskSpec, TaskType } from "./typ
 import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
 import { CapacityScheduler, capacityAvailability, readCapacity } from "./capacity";
 import { PostgresMetadata } from "./postgres-metadata";
+import { NeonMetadata, neonConfig, localSharedLessons, NeonEnvironment } from "./neon-metadata";
 import { localSharedSnapshot } from "./shared-metadata";
 import { constrainProposal, resolveRoute } from "./routing-policy";
 import { nextRoute } from "./escalation";
@@ -80,6 +81,7 @@ function usage(): string {
     "  orch serve [--project directory] [--port 8765]  (local API)",
     "  orch command --json '{...}' [--project directory]  (versioned local command)",
     "  orch shared migrate|sync|runs [--project directory]  (Docker Postgres)",
+    "  orch shared neon migrate|sync|runs --environment development|production [--project directory]  (optional Neon)",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
@@ -793,6 +795,25 @@ async function applyCommand(args: string[]): Promise<void> {
 
 async function shared(args: string[]): Promise<void> {
   const [action, ...rest] = args;
+  if (action === "neon") {
+    const [operation, ...cloudArgs] = rest;
+    const { positionals, options } = parseArguments(cloudArgs, ["project", "environment"]);
+    if (positionals.length || !["migrate", "sync", "runs"].includes(operation) ||
+        !["development", "production"].includes(option(options, "environment") ?? ""))
+      throw new Error("Use shared neon migrate|sync|runs --environment development|production [--project directory]");
+    const environment = option(options, "environment") as NeonEnvironment;
+    const database = new NeonMetadata(neonConfig(environment));
+    if (operation === "migrate") { await database.migrate(); console.log(`Neon ${environment} schema migrated`); return; }
+    const project = resolve(option(options, "project") ?? process.cwd());
+    const snapshot = await localSharedSnapshot(project);
+    if (operation === "sync") {
+      const lessons = await localSharedLessons(project);
+      await database.migrate();
+      await database.sync(snapshot, lessons);
+      console.log(`Synced ${snapshot.runs.length} runs and ${lessons.length} reviewed global lessons to Neon ${environment}`);
+    } else console.log(JSON.stringify(await database.runs(snapshot.projectId)));
+    return;
+  }
   const { positionals, options } = parseArguments(rest, ["project"]);
   if (positionals.length || !["migrate", "sync", "runs"].includes(action)) throw new Error("Use shared migrate|sync|runs [--project directory]");
   const database = new PostgresMetadata();

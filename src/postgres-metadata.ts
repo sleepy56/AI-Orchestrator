@@ -28,11 +28,12 @@ export class PostgresMetadata {
   constructor(private readonly composeProject?: string) {
     if (composeProject && !/^[a-z][a-z0-9_-]{0,40}$/.test(composeProject)) throw new Error("Invalid compose project");
   }
+  protected query(sql: string): Promise<string> { return psql(sql, this.composeProject); }
   async migrate(): Promise<void> {
     const source = await readFile(migration, "utf8");
-    await psql(`BEGIN;\nSELECT pg_advisory_xact_lock(23023);\n${source}\nINSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING;\nCOMMIT;\n`, this.composeProject);
+    await this.query(`BEGIN;\nSELECT pg_advisory_xact_lock(23023);\n${source}\nINSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING;\nCOMMIT;\n`);
   }
-  async sync(input: unknown): Promise<void> {
+  protected syncStatements(input: unknown): string[] {
     // The full payload is checked before any command reaches Postgres.
     const snapshot: SharedSnapshot = validateSharedSnapshot(input);
     const statements = ["BEGIN;", `INSERT INTO shared_projects(project_id) VALUES (${literal(snapshot.projectId)}) ON CONFLICT(project_id) DO UPDATE SET synced_at = now();`];
@@ -49,12 +50,14 @@ export class PostgresMetadata {
         VALUES (${key},${literal(attempt.taskId)},${attempt.attempt},${literal(attempt.route)},${attempt.passed},${nullable(attempt.model)},
         ${nullable(attempt.inputTokens)},${nullable(attempt.outputTokens)},${nullable(attempt.latencyMs)});`);
     }
-    statements.push("COMMIT;");
-    await psql(statements.join("\n"), this.composeProject);
+    return statements;
+  }
+  async sync(input: unknown): Promise<void> {
+    await this.query([...this.syncStatements(input), "COMMIT;"].join("\n"));
   }
   async runs(projectId: string): Promise<Record<string, unknown>[]> {
     validateSharedSnapshot({ version: 1, projectId, runs: [] });
-    const result = await psql(`SELECT COALESCE(json_agg(row_to_json(r)), '[]'::json) FROM (
+    const result = await this.query(`SELECT COALESCE(json_agg(row_to_json(r)), '[]'::json) FROM (
       SELECT run_id AS "runId", mode, status, started_at AS "startedAt", finished_at AS "finishedAt",
       last_sequence AS "lastSequence", policy_version AS "policyVersion",
       (SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM
@@ -64,7 +67,7 @@ export class PostgresMetadata {
         (SELECT task_id AS "taskId", attempt, route, passed, model, input_tokens AS "inputTokens",
           output_tokens AS "outputTokens", latency_ms AS "latencyMs"
          FROM shared_attempts WHERE project_id=shared_runs.project_id AND run_id=shared_runs.run_id ORDER BY task_id,attempt) a) AS attempts
-      FROM shared_runs WHERE project_id=${literal(projectId)} ORDER BY started_at DESC) r;`, this.composeProject);
+      FROM shared_runs WHERE project_id=${literal(projectId)} ORDER BY started_at DESC) r;`);
     return JSON.parse(result) as Record<string, unknown>[];
   }
 }
