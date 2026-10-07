@@ -78,6 +78,8 @@ export class CodexExecutor implements Executor {
       taskId: task.id, route, attempt, model: `${profile.provider}:${profile.model}`,
       succeeded: !error, output: result.finalResponse,
       retryable: result.exitCode === 0 && !result.timedOut,
+      ...(result.exitCode !== 0 && /(?:rate.?limit|quota|too many requests|retry.after|capacity exhausted)/i.test(result.stderr)
+        ? { capacityReason: `Provider capacity failure: ${result.stderr.slice(-500)}` } : {}),
       inputTokens: result.inputTokens, outputTokens: result.outputTokens,
       latencyMs: Date.now() - started, checkCommand: this.checkCommand,
       ...(check ? { checkOutput: check.output, checkExitCode: check.exitCode } : {}),

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { appendFile, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FakeExecutor } from "./executor";
@@ -18,6 +18,9 @@ import { readRunEvents, RunEventWriter } from "./run-events";
 import { TaskGraph } from "./scheduler";
 import { Difficulty, Risk, TaskSnapshot, TaskType } from "./types";
 import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
+import { CapacityScheduler, capacityAvailability, readCapacity } from "./capacity";
+import { PostgresMetadata } from "./postgres-metadata";
+import { localSharedSnapshot } from "./shared-metadata";
 
 type Options = Record<string, string | boolean>;
 
@@ -47,11 +50,13 @@ function usage(): string {
     "  orch checks skip <check-id> --reason text [--project directory]",
     "  orch checks review <check-id> --reviewer name [--project directory]",
     "  orch status [--project directory]",
+    "  orch capacity [--project directory]  (show measured or unknown provider capacity)",
     "  orch retry TASK-001 [--project directory]  (after a failed or stopped run)",
     "  orch run [--once] [--resume RUN-ID] [--project directory] [--executor fake|codex] [--check 'npm test'] [--timeout-seconds 600]",
     "  orch worktrees base <branch> <commit> [--project directory]",
     "  orch worktrees show [--project directory]",
     "  orch worktrees integrate TASK-001,TASK-002 --check 'npm test' [--project directory]",
+    "  orch worktrees verify <integration-id> --check 'npm test' [--project directory]  (after resolving and committing conflicts)",
     "  orch worktrees merge <approved-action-id> [--project directory]",
     "  orch actions request merge|deployment <destination> <artifact-revision> [--base-revision TARGET-HEAD] [--id ACTION-ID] [--project directory]",
     "  orch actions show|approve|ready <action-id> [--project directory]",
@@ -68,6 +73,7 @@ function usage(): string {
     "  orch history [--project directory]",
     "  orch serve [--project directory] [--port 8765]  (local API)",
     "  orch command --json '{...}' [--project directory]  (versioned local command)",
+    "  orch shared migrate|sync|runs [--project directory]  (Docker Postgres)",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
@@ -339,11 +345,15 @@ async function worktrees(args: string[]): Promise<void> {
     if (positionals.length !== 1 || !option(options, "check")) throw new Error("worktrees integrate needs comma-separated task IDs and --check");
     const result = await manager.integrate(positionals[0].split(","), option(options, "check")!);
     console.log(JSON.stringify(result, null, 2));
+  } else if (operation === "verify") {
+    if (positionals.length !== 1 || !option(options, "check")) throw new Error("worktrees verify needs one integration ID and --check");
+    const result = await manager.verifyIntegration(positionals[0], option(options, "check")!);
+    console.log(JSON.stringify(result, null, 2));
   } else if (operation === "merge") {
     if (positionals.length !== 1 || option(options, "check")) throw new Error("worktrees merge needs one approved action ID");
     const result = await manager.merge(positionals[0]);
     console.log(`Merged ${result.commit} into ${result.target}`);
-  } else throw new Error("Use orch worktrees base|show|integrate|merge");
+  } else throw new Error("Use orch worktrees base|show|integrate|verify|merge");
 }
 
 function printChecks(report: Awaited<ReturnType<typeof checkReport>>): void {
@@ -364,6 +374,15 @@ async function status(args: string[]): Promise<void> {
     console.log(`${record.spec.id}  ${graph.status(record.spec.id)}  ${record.spec.description}  (${record.attempts.length} attempts)`);
     if (record.status === "failed" && record.failureReason) console.log(`  Reason: ${record.failureReason}`);
   }
+  const signal = await readCapacity(resolve(option(options, "project") ?? process.cwd()));
+  console.log(`Codex capacity: ${capacityAvailability(signal) === "known" ? `${signal!.remainingTokens} measured tokens at ${signal!.observedAt}` : "unknown"}`);
+}
+
+async function capacity(args: string[]): Promise<void> {
+  const { positionals, options } = parseArguments(args, ["project"]);
+  if (positionals.length) throw new Error("capacity does not accept positional arguments");
+  const signal = await readCapacity(resolve(option(options, "project") ?? process.cwd()));
+  console.log(JSON.stringify({ availability: capacityAvailability(signal), ...(signal ? { signal } : {}) }, null, 2));
 }
 
 async function retry(args: string[]): Promise<void> {
@@ -376,6 +395,32 @@ async function retry(args: string[]): Promise<void> {
 }
 
 async function run(args: string[]): Promise<number> {
+  const { options } = parseArguments(args, ["project", "executor", "check", "once", "timeout-seconds", "resume"]);
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const lockPath = join(project, ".orch", "run.lock");
+  await mkdir(dirname(lockPath), { recursive: true });
+  let handle;
+  try { handle = await open(lockPath, "wx"); }
+  catch (error) {
+    if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error;
+    const priorPid = Number((await readFile(lockPath, "utf8")).trim());
+    if (!Number.isSafeInteger(priorPid) || priorPid < 1) throw new Error("Run lock is invalid; inspect it before retrying");
+    try { process.kill(priorPid, 0); throw new Error(`Another run is active (PID ${priorPid})`); }
+    catch (probe) { if (!(probe && typeof probe === "object" && "code" in probe && probe.code === "ESRCH")) throw probe; }
+    await rm(lockPath);
+    handle = await open(lockPath, "wx");
+  }
+  try {
+    await handle.writeFile(String(process.pid));
+    await handle.sync();
+    return await runUnlocked(args);
+  } finally {
+    await handle.close();
+    if ((await readFile(lockPath, "utf8").catch(() => "")).trim() === String(process.pid)) await rm(lockPath, { force: true });
+  }
+}
+
+async function runUnlocked(args: string[]): Promise<number> {
   const { positionals, options } = parseArguments(args, ["project", "executor", "check", "once", "timeout-seconds", "resume"]);
   if (positionals.length) throw new Error("run does not accept positional arguments");
   const project = resolve(option(options, "project") ?? process.cwd());
@@ -383,9 +428,16 @@ async function run(args: string[]): Promise<number> {
   const planning = await commands.detail();
   const resumeId = option(options, "resume");
   const prior = resumeId ? planning.runs[resumeId] : undefined;
-  if (resumeId && (!prior || prior.value.status !== "paused")) throw new Error("Run ID is not paused");
+  if (resumeId && (!prior || !["paused", "running"].includes(prior.value.status))) throw new Error("Run ID is not paused or interrupted");
   const mode = oneOf(option(options, "executor") ?? (prior?.value.mode === "live" ? "codex" : undefined), ["fake", "codex"] as const, "fake", "executor");
   if (prior && prior.value.mode !== (mode === "fake" ? "simulated" : "live")) throw new Error("Resume must use the original executor mode");
+  const priorEvents = resumeId ? (await readRunEvents(project)).filter((event) => event.runId === resumeId) : [];
+  const events = new RunEventWriter(project, resumeId, priorEvents.at(-1)?.sequence ?? 0);
+  if (resumeId && prior?.value.status === "running") {
+    await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
+      payload: { runId: resumeId, status: "paused", mode: mode === "fake" ? "simulated" : "live", reason: "Previous run was interrupted" } });
+    await events.append({ type: "run.paused", reason: "Previous run was interrupted" });
+  }
   const gate = executionGate(planning);
   if (gate) {
     if (!resumeId) {
@@ -397,7 +449,7 @@ async function run(args: string[]): Promise<number> {
   }
   const graph = await loadGraph(project);
   const unfinished = graph.snapshot().tasks.filter((record) => record.status === "running");
-  if (unfinished.length) throw new Error(`Tasks still marked running: ${unfinished.map((record) => record.spec.id).join(", ")}. Inspect changes and use orch retry after the prior process stops.`);
+  if (unfinished.length && !resumeId) throw new Error(`Tasks still marked running: ${unfinished.map((record) => record.spec.id).join(", ")}. Inspect changes and use orch retry after the prior process stops.`);
   const timeoutMs = parseTimeout(option(options, "timeout-seconds"), 600);
   if (mode === "codex" && !option(options, "check")?.trim()) {
     throw new Error("Live Codex runs require --check with a project validation command");
@@ -408,8 +460,23 @@ async function run(args: string[]): Promise<number> {
   }
   const knowledge = new KnowledgeStore(project);
   const registry = await loadRegistry(project);
-  const priorEvents = resumeId ? (await readRunEvents(project)).filter((event) => event.runId === resumeId) : [];
-  const events = new RunEventWriter(project, resumeId, priorEvents.at(-1)?.sequence ?? 0);
+  const scheduler = mode === "codex" ? await CapacityScheduler.load(project, registry) : undefined;
+  if (unfinished.length) {
+    const workers = mode === "codex" ? (await new WorktreeManager(project).load()).detail() : undefined;
+    const records = workers ? (await workers).workers : {};
+    for (const record of unfinished) {
+      const worker = records[record.spec.id];
+      if (worker?.validation?.passed) throw new Error(`Task ${record.spec.id} has validated worktree output; inspect and reconcile it before retry`);
+      if (worker && !(await stat(worker.path).then((item) => item.isDirectory(), () => false)))
+        throw new Error(`Task ${record.spec.id} worktree is missing; inspect before retry`);
+      if (worker) throw new Error(`Task ${record.spec.id} has interrupted worktree output at ${worker.path}. Ensure its worker has stopped and inspect changes, then use orch retry ${record.spec.id}, repin the approved worktree base, and resume this run`);
+    }
+    for (const record of unfinished) {
+      graph.retry(record.spec.id);
+      await events.append({ type: "task.interrupted", taskId: record.spec.id, reason: "Previous worker stopped before a worktree was recorded" });
+    }
+    await saveSnapshot(project, graph.snapshot());
+  }
   const selectedLessons = new Map<string, SelectedLesson[]>();
   const recordedSelections = new Set<string>();
   const executor = mode === "fake"
@@ -434,7 +501,7 @@ async function run(args: string[]): Promise<number> {
   const policyVersion = registry.policyVersion ?? 1;
   await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
     payload: { runId: events.runId, status: "running", mode: mode === "fake" ? "simulated" : "live" } });
-  await events.append(priorEvents.length ? { type: "run.resumed" } : { type: "run.started", mode: mode === "fake" ? "simulated" : "live", tasks: graph.snapshot().tasks, policyVersion });
+  await events.append(priorEvents.some((event) => event.type === "run.started") ? { type: "run.resumed" } : { type: "run.started", mode: mode === "fake" ? "simulated" : "live", tasks: graph.snapshot().tasks, policyVersion });
   console.log(`Run ID: ${events.runId}`);
   console.log(mode === "fake" ? "Running with fake workers; project code will not be changed." : "Running live Codex tasks in isolated Git worktrees.");
   const recorded = new Map(graph.snapshot().tasks.map((record) => [record.spec.id, record.attempts.length]));
@@ -449,6 +516,7 @@ async function run(args: string[]): Promise<number> {
     }
   }, {
     maxTasks: options.once === true ? 1 : undefined,
+    capacity: scheduler ? (task, inFlight) => scheduler.decide(task, inFlight) : undefined,
     beforeTask: async () => mode === "codex" ? worktreeBaseGate(await commands.detail()) : executionGate(await commands.detail()),
     onEvent: async (event) => {
       await events.append(event);
@@ -474,7 +542,7 @@ async function run(args: string[]): Promise<number> {
   const finalGate = result.paused ?? (mode === "codex" ? worktreeBaseGate(await commands.detail()) : executionGate(await commands.detail()));
   if (finalGate) {
     await commands.execute({ version: 1, kind: "run.record", expectedRevision: await commands.revision(),
-      payload: { runId: events.runId, status: "paused", mode: mode === "fake" ? "simulated" : "live" } });
+      payload: { runId: events.runId, status: "paused", mode: mode === "fake" ? "simulated" : "live", reason: finalGate } });
     await events.append({ type: "run.paused", reason: finalGate });
     console.log(`Run ${events.runId} paused: ${finalGate}`);
     return 0;
@@ -658,6 +726,18 @@ async function applyCommand(args: string[]): Promise<void> {
   console.log(JSON.stringify(result));
 }
 
+async function shared(args: string[]): Promise<void> {
+  const [action, ...rest] = args;
+  const { positionals, options } = parseArguments(rest, ["project"]);
+  if (positionals.length || !["migrate", "sync", "runs"].includes(action)) throw new Error("Use shared migrate|sync|runs [--project directory]");
+  const database = new PostgresMetadata();
+  if (action === "migrate") { await database.migrate(); console.log("Shared metadata schema migrated"); return; }
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const snapshot = await localSharedSnapshot(project);
+  if (action === "sync") { await database.migrate(); await database.sync(snapshot); console.log(`Synced ${snapshot.runs.length} runs for ${snapshot.projectId}`); }
+  else console.log(JSON.stringify(await database.runs(snapshot.projectId)));
+}
+
 async function installSkill(args: string[]): Promise<void> {
   const { positionals, options } = parseArguments(args, ["to", "force"]);
   if (positionals.length) throw new Error("skill install does not accept positional arguments");
@@ -703,6 +783,9 @@ async function main(args: string[]): Promise<number> {
     case "status":
       await status(rest);
       return 0;
+    case "capacity":
+      await capacity(rest);
+      return 0;
     case "retry":
       await retry(rest);
       return 0;
@@ -730,6 +813,9 @@ async function main(args: string[]): Promise<number> {
       return 0;
     case "command":
       await applyCommand(rest);
+      return 0;
+    case "shared":
+      await shared(rest);
       return 0;
     case "skill":
       if (rest[0] !== "install") throw new Error("Use orch skill install");

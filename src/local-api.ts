@@ -10,6 +10,7 @@ import { TaskSnapshot } from "./types";
 import { Command, CommandService } from "./command-service";
 import { checkReport, runBaseline, runCheck } from "./checks";
 import { PlanningWorkflow } from "./planning";
+import { localSharedSnapshot } from "./shared-metadata";
 
 async function requestBody(request: IncomingMessage): Promise<unknown> {
   let body = "";
@@ -102,6 +103,7 @@ export function createLocalApi(project: string): Server {
       if (url.pathname === "/api/commands") return json(response, 200, await new CommandService(project).detail());
       if (url.pathname === "/api/checks") return json(response, 200, await checkReport(new CommandService(project), url.searchParams.get("taskId") ?? undefined));
       if (url.pathname === "/api/commands/shared") return json(response, 200, await new CommandService(project).sharedView());
+      if (url.pathname === "/api/shared/runs") return json(response, 200, await localSharedSnapshot(project));
       if (url.pathname === "/api/tasks") return json(response, 200, { tasks: await tasks(project) });
       if (url.pathname === "/api/models") {
         const [registry, history] = await Promise.all([loadRegistry(project), new KnowledgeStore(project).list("project")]);
