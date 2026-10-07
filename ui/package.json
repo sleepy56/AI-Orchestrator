@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json && vite build",
-    "test": "node --test test/evidence.test.cjs test/replay.test.cjs",
+    "test": "node --test test/evidence.test.cjs test/replay.test.cjs test/orch-workflow.contract.test.cjs",
     "test:e2e": "playwright test"
   },
   "dependencies": {

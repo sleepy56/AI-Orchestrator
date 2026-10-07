@@ -86,18 +86,10 @@ The focused workflow suite must use names containing the task tag shown below. T
 | `[TASK-026]` | Exercise the Neon adapter with a fake transport, and a configured test database when available; sync only allowlisted metadata and a reviewed generic lesson; reject an unreviewed or identifying lesson; disconnect sync and continue locally without data loss. |
 | `[TASK-027]` | Exercise an example project's question, plan, user check, approval, isolated run, integration conflict, capacity pause/resume, route rollback, merge gate, and privacy export as one end-to-end flow. |
 
-## Prepared CLI check
+## Completed task checks
 
-`scripts/check-task.cjs` compiles the backend, runs the existing backend regression suite, requires at least one passing focused acceptance test for the named task, and runs UI checks for UI tasks. It refuses to validate a different task while an Orch task is running. For TASK-011 through TASK-014 it selects the existing knowledge contract suite. TASK-014 also requires `ui/test/orch-workflow.contract.test.cjs`. TASK-015 must add tagged backend and UI integration tests and pass the entire knowledge contract suite. For TASK-016 through TASK-027, the worker must add behavioral tests in `src/orch-workflow.contract.test.ts` with names tagged `[TASK-016]` and so on. TASK-017 through TASK-020, TASK-025, and TASK-027 also require matching UI tests. Missing checks fail instead of allowing an unrelated `npm test` pass.
+The one-time task gate used while implementing TASK-011 through TASK-027 has been removed. Its behavioral tests remain in `src/knowledge-system.contract.test.ts`, `src/orch-workflow.contract.test.ts`, and `ui/test/orch-workflow.contract.test.cjs`, tagged with the task IDs above. Run `npm test` for backend regressions and contracts, `npm --prefix ui test` for UI contracts, and `npm --prefix ui run test:e2e` for browser checks. The optional database round trips require `ORCH_TEST_POSTGRES=1` with local Docker Postgres or `ORCH_TEST_NEON=1` with a configured Neon development URL. Ordinary runs leave those external checks skipped and report that limit.
 
-Inspect the prepared mapping with `node scripts/check-task.cjs --list`. To validate TASK-011 after its code is written, use `node scripts/check-task.cjs TASK-011`. To give the same command to Orch when you choose to start it:
-
-```powershell
-node dist/cli.js status
-node dist/cli.js doctor codex --timeout-seconds 60
-node dist/cli.js run --once --executor codex --check "node scripts/check-task.cjs TASK-011" --timeout-seconds 900
-```
-
-After that run, inspect its diff and test result, then use the ID of the next ready task in the check command. `--once` starts one ready task; it does not choose an arbitrary ID. TASK-019 persists task checks and TASK-020 gates drafted runs and records exact merge and deployment approvals. Worktree integration and the actual merge executor belong to TASK-021. No merge or deployment is part of the commands above.
+For a new plan, add task-specific checks with `orch checks add` and approve their exact revision before `orch run`. Review each worker diff and combined integration result before approving a merge or deployment.
 
 The full product behavior and privacy boundary are specified in [orch-product-contract.md](orch-product-contract.md).

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import { KnowledgeStore, AttemptEntry } from "./knowledge";
@@ -15,6 +16,246 @@ import { FakeExecutor } from "./executor";
 import { orchestrate } from "./orchestrator";
 import { TaskGraph } from "./scheduler";
 import { WorktreeManager } from "./worktrees";
+import { CapacityScheduler, readCapacity } from "./capacity";
+import { readRunEvents } from "./run-events";
+import { localSharedSnapshot, validateSharedSnapshot } from "./shared-metadata";
+import { PostgresMetadata } from "./postgres-metadata";
+import { NeonMetadata, localSharedLessons, neonConfig, validateSharedLessons } from "./neon-metadata";
+import { resolveRoute } from "./routing-policy";
+import { recommendModelRoute } from "./model-decisions";
+
+test("[TASK-025] CLI and local UI API share revisions, approvals, runs, learning, and private detail only while connected", async () => fixture(async (project, _other, home) => {
+  const privateTask = "Implement private product architecture at src/private.ts";
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", privateTask, "--type", "analysis").status, 0);
+  const service = new CommandService(project);
+  const afterCli = await service.detail();
+  const previousHome = process.env.ORCH_HOME;
+  process.env.ORCH_HOME = home;
+  const server = createLocalApi(project);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  const get = async (path: string) => {
+    const response = await fetch(`${base}${path}`);
+    assert.equal(response.status, 200, path);
+    return response.json() as Promise<Record<string, any>>;
+  };
+  const post = async (path: string, body: unknown) => {
+    const response = await fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const result = await response.json() as Record<string, any>;
+    assert.equal(response.status, 200, JSON.stringify(result));
+    return result;
+  };
+  try {
+    const local = await get("/api/commands");
+    assert.equal(local.revision, afterCli.revision);
+    assert.equal(local.tasks[0].spec.description, privateTask);
+    const workflow = await get("/api/workflow");
+    assert.equal(workflow.revision, afterCli.revision);
+    assert.equal(workflow.capacity.availability, "unknown");
+    assert.deepEqual(workflow.worktrees.workers, {});
+    assert.equal(workflow.policy.version, afterCli.policy.revision);
+
+    // These are the same command envelopes sent by the Planning UI.
+    await post("/api/commands", { version: 1, kind: "approval.grant", expectedRevision: local.revision,
+      payload: { target: "plan", targetRevision: local.plan.revision, actor: "user" } });
+    assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
+    const run = await post("/api/workflow", { operation: "run", mode: "fake", once: true });
+    assert.match(run.id, /^[0-9a-f-]{36}$/);
+    let runJob: Record<string, any> | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      runJob = (await get("/api/workflow")).jobs.find((job: Record<string, any>) => job.id === run.id);
+      if (runJob?.status !== "running") break;
+      await new Promise((done) => setTimeout(done, 50));
+    }
+    assert.equal(runJob?.status, "finished", runJob?.errorOutput);
+    assert.match(runJob.output, /Running with fake workers/);
+    assert.match(cli(project, home, "status").stdout, /TASK-001  completed/);
+    const updated = await get("/api/workflow");
+    assert.ok(Object.values(updated.runs).some((record: any) => record.value.status === "finished"));
+
+    await writeFile(join(project, "limits.json"), JSON.stringify({ blockedModels: ["gpt-6-luna"] }));
+    assert.equal(cli(project, home, "models", "limits", "--file", "limits.json", "--reason", "User budget").status, 0);
+    const afterLimits = await get("/api/workflow");
+    assert.equal(afterLimits.policy.version, 1);
+    assert.deepEqual(afterLimits.policy.routing.limits.blockedModels, ["gpt-6-luna"]);
+    assert.equal(afterLimits.policy.history[0].reason, "User budget");
+    await post("/api/commands", { version: 1, kind: "policy.limits", expectedRevision: afterLimits.revision,
+      payload: { actor: "user", reason: "Allow reviewed Codex routes", limits: { allowedProviders: ["codex"] } } });
+    const cliPolicy = JSON.parse(cli(project, home, "models", "policy").stdout);
+    assert.equal(cliPolicy.version, 2);
+    assert.equal(cliPolicy.history.at(-1).reason, "Allow reviewed Codex routes");
+
+    const note = await post("/api/knowledge/action", { operation: "add", text: "For analysis tasks, inspect public references", taskCategory: "analysis" });
+    assert.match(cli(project, home, "knowledge", "list").stdout, new RegExp(note.id));
+    await post("/api/knowledge/action", { operation: "review", id: note.id, status: "approved" });
+    const promoted = await post("/api/knowledge/action", { operation: "promote", id: note.id });
+    assert.match(cli(project, home, "knowledge", "list", "--scope", "global").stdout, new RegExp(promoted.id));
+    const shared = JSON.stringify(await get("/api/commands/shared"));
+    assert.doesNotMatch(shared, /private product architecture|src\/private\.ts|inspect public references|gpt-6-luna|User budget/);
+    assert.equal(shared.includes(project), false);
+    const sharedRuns = JSON.stringify(await get("/api/shared/runs"));
+    assert.doesNotMatch(sharedRuns, /private product architecture|src\/private\.ts|inspect public references/);
+    assert.equal(sharedRuns.includes(project), false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+    if (previousHome === undefined) delete process.env.ORCH_HOME;
+    else process.env.ORCH_HOME = previousHome;
+  }
+  await assert.rejects(fetch(`${base}/api/commands`));
+  await assert.rejects(fetch(`${base}/api/workflow`));
+}));
+
+test("[TASK-022] a provider capacity failure defers its task instead of failing it", async () => {
+  const task: TaskSpec = { id: "TASK-001", description: "Rename a symbol", type: "rename", difficulty: "easy", risk: "low", dependsOn: [] };
+  const graph = TaskGraph.fromSpecs([task]);
+  const paused = await orchestrate(graph, { parallel: false, execute: async (_task, route, attempt) => ({
+    taskId: task.id, route, attempt, succeeded: false, output: "", retryable: false,
+    error: "Quota reached", capacityReason: "Provider capacity failure: quota reached",
+  }) });
+  assert.match(paused.paused ?? "", /quota reached/);
+  assert.equal(graph.get(task.id).status, "pending");
+  assert.equal(graph.get(task.id).attempts.length, 1);
+  const fake = new FakeExecutor();
+  await orchestrate(graph, fake);
+  assert.equal(graph.get(task.id).status, "completed");
+  assert.equal(fake.calls[0].attempt, 2);
+});
+
+test("[TASK-022] measured near-limit capacity checkpoints starts, resumes after a fresh signal, and keeps unknown quota unknown", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Small rename", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
+  assert.equal(cli(project, home, "plan", "Another rename", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
+  const signalPath = join(project, ".orch", "capacity.json");
+  const snapshotPath = join(project, ".orch", "tasks.json");
+  const graph = new TaskGraph(JSON.parse(await readFile(snapshotPath, "utf8")));
+  const registry = await loadRegistry(project);
+  const scheduler = await CapacityScheduler.load(project, registry);
+  const executor = new FakeExecutor();
+  await writeFile(signalPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1_000, limitTokens: 100_000, maxConcurrent: 3 }));
+  const paused = await orchestrate(graph, executor, (snapshot) => writeFile(snapshotPath, JSON.stringify(snapshot)),
+    { capacity: (task, inFlight) => scheduler.decide(task, inFlight) });
+  assert.match(paused.paused ?? "", /near exhaustion/);
+  assert.equal(executor.calls.length, 0);
+  assert.ok(paused.snapshot.tasks.every((record) => record.status === "pending"));
+  assert.equal((await readCapacity(project))?.remainingTokens, 1_000);
+
+  await writeFile(signalPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1_000_000, limitTokens: 1_000_000, maxConcurrent: 3 }));
+  const resumed = await orchestrate(new TaskGraph(JSON.parse(await readFile(snapshotPath, "utf8"))), executor, undefined,
+    { capacity: (task, inFlight) => scheduler.decide(task, inFlight) });
+  assert.equal(resumed.paused, undefined);
+  assert.equal(executor.calls.length, 2);
+  assert.ok(resumed.snapshot.tasks.every((record) => record.status === "completed"));
+  await rm(signalPath);
+  assert.equal((await scheduler.decide(resumed.snapshot.tasks[0].spec, [])).availability, "unknown");
+  assert.match(cli(project, home, "capacity").stdout, /"availability": "unknown"/);
+}));
+
+test("[TASK-022] concurrency is bounded by measured workers and uncertain projected USD cost", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "First rename", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
+  const task = new TaskGraph(JSON.parse(await readFile(join(project, ".orch", "tasks.json"), "utf8"))).ready()[0];
+  const capacityPath = join(project, ".orch", "capacity.json");
+  const settingsPath = join(project, ".orch", "scheduler.json");
+  await writeFile(capacityPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 900_000, limitTokens: 1_000_000, maxConcurrent: 2 }));
+  await writeFile(settingsPath, JSON.stringify({ maxWorkers: 4, maxProjectedCostUsd: 0.1 }));
+  const registry = await loadRegistry(project);
+  const noPrice = await CapacityScheduler.load(project, registry);
+  assert.match((await noPrice.decide(task, [])).reason ?? "", /Projected cost is unknown/);
+  await writeFile(join(project, ".orch", "prices.json"), JSON.stringify({ version: "test", currency: "USD", models: {
+    "codex:gpt-6-luna": { inputPerMillion: 10, outputPerMillion: 10 },
+  } }));
+  const priced = await CapacityScheduler.load(project, registry);
+  assert.match((await priced.decide(task, [])).reason ?? "", /cost exceeds/);
+  await writeFile(settingsPath, JSON.stringify({ maxWorkers: 4, maxProjectedCostUsd: 1 }));
+  const roomy = await CapacityScheduler.load(project, registry);
+  const decision = await roomy.decide(task, []);
+  assert.equal(decision.availability, "known");
+  assert.equal(decision.limit, Math.min(2, availableParallelism()));
+  assert.equal((await roomy.decide(task, [task])).limit, 1);
+  await writeFile(capacityPath, JSON.stringify({ provider: "codex", observedAt: new Date(Date.now() - 600_000).toISOString(), remainingTokens: 900_000, maxConcurrent: 2 }));
+  assert.match((await roomy.decide(task, [])).reason ?? "", /stale/);
+  assert.match(cli(project, home, "capacity").stdout, /"availability": "unknown"/);
+}));
+
+test("[TASK-022] a paused run safely recovers an interrupted task before starting again", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Recover work").status, 0);
+  const service = new CommandService(project);
+  const runId = "123e4567-e89b-42d3-a456-426614174022";
+  await service.execute({ version: 1, kind: "run.record", expectedRevision: await service.revision(),
+    payload: { runId, status: "running", mode: "simulated" } });
+  const path = join(project, ".orch", "tasks.json");
+  const graph = new TaskGraph(JSON.parse(await readFile(path, "utf8")));
+  graph.markRunning("TASK-001");
+  await writeFile(path, JSON.stringify(graph.snapshot()));
+  const result = cli(project, home, "run", "--resume", runId);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /TASK-001: completed/);
+  assert.equal((await service.detail()).runs[runId].value.status, "finished");
+  const events = (await readRunEvents(project)).filter((event) => event.runId === runId);
+  assert.ok(events.some((event) => event.type === "run.paused" && event.reason === "Previous run was interrupted"));
+  assert.ok(events.some((event) => event.type === "task.interrupted"));
+}));
+
+test("[TASK-022] a live capacity pause persists and resumes the same run after remeasurement", async () => fixture(async (project, other, home) => {
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, "README.md"), "Capacity fixture\n");
+  git("add", ".");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Complete a small rename", "--type", "rename", "--difficulty", "easy", "--risk", "low").status, 0);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:2}}));\n");
+  await writeFile(join(bin, "codex.cmd"), "rem fake launcher\n");
+  const launcher = join(bin, "codex");
+  await writeFile(launcher, `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(launcher, 0o755);
+  const path = process.platform === "win32" ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const run = (...args: string[]) => spawnSync(process.execPath, [join(__dirname, "cli.js"), ...args], {
+    cwd: project, encoding: "utf8", env: { ...process.env, ORCH_HOME: home, PATH: path },
+  });
+  const signalPath = join(project, ".orch", "capacity.json");
+  await writeFile(signalPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1_000, limitTokens: 1_000_000, maxConcurrent: 2 }));
+  const paused = run("run", "--executor", "codex", "--check", "node -e \"process.exit(0)\"");
+  assert.equal(paused.status, 0, paused.stderr);
+  const runId = /Run ID: ([a-f0-9-]+)/.exec(paused.stdout)?.[1];
+  assert.ok(runId, paused.stdout);
+  assert.match(paused.stdout, /paused: Provider capacity near exhaustion/);
+  assert.equal(Object.keys((await (await new WorktreeManager(project).load()).detail()).workers).length, 0);
+  assert.equal((await new CommandService(project).detail()).runs[runId].value.status, "paused");
+  const snapshotPath = join(project, ".orch", "tasks.json");
+  const interrupted = new TaskGraph(JSON.parse(await readFile(snapshotPath, "utf8")));
+  const task = interrupted.ready()[0];
+  interrupted.markRunning(task.id);
+  await writeFile(snapshotPath, JSON.stringify(interrupted.snapshot()));
+  const worker = await (await new WorktreeManager(project).load()).prepare(task);
+  await writeFile(join(worker.path, "partial.txt"), "unfinished work\n");
+  const unsafe = run("run", "--resume", runId, "--check", "node -e \"process.exit(0)\"");
+  assert.notEqual(unsafe.status, 0);
+  assert.match(unsafe.stderr, /inspect changes, then use orch retry/);
+  assert.equal((await readFile(join(worker.path, "partial.txt"), "utf8")).trim(), "unfinished work");
+  assert.equal(cli(project, home, "retry", task.id).status, 0);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+  await writeFile(signalPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1_000_000, limitTokens: 1_000_000, maxConcurrent: 2 }));
+  const resumed = run("run", "--resume", runId, "--check", "node -e \"process.exit(0)\"");
+  assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+  assert.equal((await new CommandService(project).detail()).runs[runId].value.status, "finished");
+  assert.ok((await readRunEvents(project)).some((event) => event.runId === runId && event.type === "run.resumed"));
+}));
 
 test("[TASK-021] live CLI workers validate inside separate worktrees and record Codex context IDs", async () => fixture(async (project, other, home) => {
   const git = (...args: string[]) => {
@@ -97,6 +338,7 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.equal(cli(project, home, "init", "--docs", "README.md").status, 0);
   assert.equal(cli(project, home, "plan", "Change shared left").status, 0);
   assert.equal(cli(project, home, "plan", "Change shared right").status, 0);
+  assert.equal(cli(project, home, "plan", "Build on both", "--after", "TASK-001,TASK-002").status, 0);
   assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
   const tasks = (await new CommandService(project).detail()).tasks.map((entry) => entry.spec);
   const manager = await new WorktreeManager(project).load();
@@ -114,10 +356,25 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.deepEqual(detail.workers[tasks[0].id].lessonIds, ["lesson-left"]);
   assert.equal(detail.workers[tasks[0].id].contextId, "thread-left");
   assert.equal(detail.workers[tasks[1].id].contextId, "thread-right");
-  const integrated = await manager.integrate(tasks.map((task) => task.id), "node -e \"process.exit(0)\"");
+  const integrated = await manager.integrate(tasks.slice(0, 2).map((task) => task.id), "node -e \"process.exit(0)\"");
   assert.deepEqual(integrated.conflicts, ["shared.txt"]);
   assert.match(integrated.diff, /left|right/);
   assert.equal(integrated.actionId, undefined);
+  assert.equal(git("rev-parse", "main"), base);
+  await assert.rejects(manager.verifyIntegration(integrated.id, "node -e \"process.exit(0)\""), /Resolve all integration conflicts/);
+  await writeFile(join(integrated.path, "shared.txt"), "left and right\n");
+  git("-C", integrated.path, "add", "shared.txt");
+  git("-C", integrated.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Resolve integration");
+  const verified = await manager.verifyIntegration(integrated.id,
+    "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').includes('left and right')?0:1)\"");
+  assert.deepEqual(verified.conflicts, []);
+  assert.equal(verified.check?.passed, true, verified.check?.output);
+  assert.ok(verified.actionId);
+  const dependent = await manager.prepare(tasks[2]);
+  assert.deepEqual(dependent.integrationIds, [integrated.id]);
+  assert.deepEqual(dependent.dependencies, { "TASK-001": detail.workers[tasks[0].id].commit, "TASK-002": detail.workers[tasks[1].id].commit });
+  assert.equal((await readFile(join(dependent.path, "shared.txt"), "utf8")).trim(), "left and right");
+  assert.equal(git("-C", dependent.path, "merge-base", "--is-ancestor", verified.commit!, dependent.base), "");
   assert.equal(git("rev-parse", "main"), base);
 }));
 
@@ -411,14 +668,17 @@ test("[TASK-018] consequential clarification yields an editable acyclic review d
   assert.equal(local.plan.revision, state.plan.revision);
   assert.equal(local.plan.value.draft.tasks[0].id, "TASK-101");
   const run = cli(project, home, "run", "--once");
-  assert.notEqual(run.status, 0);
-  assert.deepEqual((await service.detail()).runs, {});
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /paused/);
+  assert.ok(Object.values((await service.detail()).runs).every((record) => record.value.status === "paused"));
   assert.equal(cli(project, home, "draft", "approve").status, 0);
   assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
   state = await service.detail();
   await service.execute({ version: 1, kind: "plan.draft", expectedRevision: state.revision, payload: { tasks } });
   assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, false);
-  assert.notEqual(cli(project, home, "run", "--once").status, 0);
+  const revisedRun = cli(project, home, "run", "--once");
+  assert.equal(revisedRun.status, 0, revisedRun.stderr);
+  assert.match(revisedRun.stdout, /paused/);
 }));
 
 async function fixture(work: (a: string, b: string, home: string) => Promise<void>) {
@@ -720,4 +980,476 @@ test("[TASK-017] local UI API registers a previously uninitialized directory", a
     server.closeAllConnections();
     await new Promise<void>((done) => server.close(() => done()));
   }
+}));
+
+test("[TASK-023] local run projection allows metadata and rejects private or unexpected fields", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const privateText = "Private product architecture prompt and source diff at C:\\secret\\src\\index.ts";
+  assert.equal(cli(project, home, "plan", privateText, "--type", "refactor", "--risk", "high").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const eventFile = join(project, ".orch", "runs.jsonl");
+  const events = (await readFile(eventFile, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, any>);
+  const finished = events.find((event) => event.type === "attempt.finished");
+  assert.ok(finished);
+  finished.attempt.response = privateText;
+  finished.attempt.checkOutput = privateText;
+  finished.rawWorkerOutput = privateText;
+  await writeFile(eventFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  const snapshot = await localSharedSnapshot(project);
+  assert.equal(snapshot.runs.length, 1);
+  assert.equal(snapshot.runs[0].tasks[0].category, "refactor");
+  assert.equal(snapshot.runs[0].tasks[0].risk, "high");
+  assert.equal(snapshot.runs[0].attempts[0].passed, true);
+  assert.doesNotMatch(JSON.stringify(snapshot), /Private|architecture|prompt|source|diff|secret|index\.ts/i);
+  const local = await api<Record<string, any>>(project, home, "/api/commands");
+  assert.equal(local.tasks[0].spec.description, privateText);
+  const localEvents = await api<Record<string, any>>(project, home, `/api/runs/${snapshot.runs[0].runId}/events`);
+  assert.match(JSON.stringify(localEvents), /rawWorkerOutput/);
+  const shared = await api<Record<string, any>>(project, home, "/api/shared/runs");
+  assert.deepEqual(shared, snapshot);
+  const rejects = [
+    { ...snapshot, unexpected: { path: privateText } },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], prompt: privateText }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], tasks: [{ ...snapshot.runs[0].tasks[0], source: privateText }] }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], attempts: [{ ...snapshot.runs[0].attempts[0], rawOutput: privateText }] }] },
+    { ...snapshot, runs: [{ ...snapshot.runs[0], attempts: [{ ...snapshot.runs[0].attempts[0], model: privateText }] }] },
+  ];
+  const database = new PostgresMetadata();
+  for (const payload of rejects) {
+    assert.throws(() => validateSharedSnapshot(payload), /Unknown|Invalid/);
+    await assert.rejects(database.sync(payload), /Unknown|Invalid/);
+  }
+}));
+
+test("[TASK-023] fresh Docker Postgres migrates and round-trips allowed run metadata", { skip: process.env.ORCH_TEST_POSTGRES !== "1" }, async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "A private task").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const snapshot = await localSharedSnapshot(project);
+  const compose = join(__dirname, "..", "compose.yaml");
+  const name = `orch023${process.pid}`;
+  const docker = (...args: string[]) => spawnSync("docker", ["compose", "-f", compose, "-p", name, ...args], { encoding: "utf8", timeout: 120_000 });
+  const started = docker("up", "-d", "--wait");
+  assert.equal(started.status, 0, started.stderr);
+  try {
+    const store = new PostgresMetadata(name);
+    await store.migrate();
+    await store.migrate();
+    await store.sync(snapshot);
+    await store.sync(snapshot);
+    const rows = await store.runs(snapshot.projectId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].runId, snapshot.runs[0].runId);
+    assert.equal(rows[0].mode, "simulated");
+    assert.equal((rows[0].tasks as unknown[]).length, 1);
+    assert.equal((rows[0].attempts as unknown[]).length, 1);
+    assert.doesNotMatch(JSON.stringify(rows), /private task/i);
+  } finally {
+    const stopped = docker("down", "-v");
+    assert.equal(stopped.status, 0, stopped.stderr);
+  }
+}));
+
+test("[TASK-026] Neon fake transport sends allowlisted runs and reviewed generic lessons; offline local work continues", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Private product architecture at C:\\secret\\source.ts", "--type", "refactor").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const store = new KnowledgeStore(project, home);
+  const pending = await store.note("project", "Review reusable refactor boundaries", "refactor");
+  assert.throws(() => validateSharedLessons([{ id: pending.id, text: pending.text, taskCategory: pending.taskCategory,
+    updatedAt: pending.updatedAt, reviewStatus: "pending", sourceEntryId: pending.id }]), /Invalid/);
+    assert.equal(cli(project, home, "knowledge", "review", pending.id, "--status", "approved").status, 0);
+    assert.equal(cli(project, home, "knowledge", "promote", pending.id).status, 0);
+    await writeFile(join(home, "knowledge.jsonl"), `${JSON.stringify({ kind: "attempt", at: "2026-01-01T00:00:00.000Z",
+      taskId: "OLD-1", taskType: "refactor", difficulty: "moderate", risk: "medium", route: "sol-medium",
+      model: "codex:gpt-6-sol", passed: true, errors: [], simulated: false })}\n`);
+    const lessons = await localSharedLessons(project, home);
+  assert.equal(lessons.length, 1);
+  assert.throws(() => validateSharedLessons([{ ...lessons[0], text: "Inspect C:\\secret\\source.ts" }]), /generalized/);
+  assert.throws(() => validateSharedLessons([{ ...lessons[0], rawOutput: "private" }]), /Unknown/);
+  const snapshot = await localSharedSnapshot(project);
+  const config = neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-test.neon.tech/dev?sslmode=require",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-prod.neon.tech/prod?sslmode=require" });
+  assert.equal(config.database, "dev");
+  assert.equal(neonConfig("production", { ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-prod.neon.tech/prod" }).database, "prod");
+  assert.throws(() => neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@localhost/dev" }), /Invalid/);
+  assert.throws(() => neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-test.neon.tech/dev",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-test.neon.tech/dev" }), /must be separate/);
+  const queries: string[] = [];
+  const database = new NeonMetadata(config, { query: async (sql) => { queries.push(sql); return ""; } });
+  await database.migrate();
+  await database.sync(snapshot, lessons);
+  const sent = queries.join("\n");
+  assert.match(sent, /shared_global_lessons/);
+  assert.match(sent, /Review reusable refactor boundaries/);
+  assert.match(sent, /INSERT INTO shared_runs/);
+  assert.doesNotMatch(sent, /Private product|secret|source\.ts|password|source_entry|rawOutput/);
+  await assert.rejects(database.sync({ ...snapshot, privatePath: project }, lessons), /Unknown/);
+  assert.equal(queries.length, 3);
+  const offline = new NeonMetadata(config, { query: async () => { throw new Error("cloud unavailable"); } });
+  await assert.rejects(offline.sync(snapshot, lessons), /cloud unavailable/);
+  assert.deepEqual(await localSharedSnapshot(project), snapshot);
+  assert.deepEqual(await localSharedLessons(project, home), lessons);
+  assert.equal(cli(project, home, "plan", "Continue locally").status, 0);
+}));
+
+test("[TASK-026] configured Neon test database round-trips metadata and a global lesson", { skip: process.env.ORCH_TEST_NEON !== "1" }, async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Private source context").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const store = new KnowledgeStore(project, home);
+  const note = await store.note("project", "For analysis, inspect bounded evidence", "analysis");
+  await store.review(note.id, "approved");
+  await store.promote(note.id);
+  const snapshot = await localSharedSnapshot(project);
+  const database = new NeonMetadata(neonConfig("development"));
+  await database.migrate();
+  await database.sync(snapshot, await localSharedLessons(project, home));
+  const rows = await database.runs(snapshot.projectId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].runId, snapshot.runs[0].runId);
+  assert.doesNotMatch(JSON.stringify(rows), /Private source context/);
+}));
+
+test("[TASK-027] example project completes clarification, approved live work, conflict review, rollback, and private sync", async () => fixture(async (project, other, home) => {
+  const privateDetail = "Private product architecture at C:\\secret\\source.ts";
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", ["-c", `safe.directory=${project.replace(/\\/g, "/")}`, ...args], { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\n");
+  await writeFile(join(project, "README.md"), `${privateDetail}\n`);
+  await writeFile(join(project, "shared.txt"), "base\n");
+  git("add", ".gitignore", "README.md", "shared.txt");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Example base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(cli(project, home, "init", "--docs", "README.md").status, 0);
+
+  const tasks = ["left", "right"].map((side, index) => ({
+    id: `TASK-10${index + 1}`, description: `Write ${side} export format`, type: "analysis", difficulty: "moderate", risk: "medium", dependsOn: [],
+    acceptanceCriteria: [`${side} export is reviewable`], areas: ["shared.txt"], workerProfile: "sol-medium", context: ["README.md"],
+    verification: [`review: Inspect ${side} export against the chosen format`],
+  }));
+  const planning = new PlanningWorkflow(project, { propose: async ({ answers }) => answers
+    ? { questions: [], tasks }
+    : { questions: [{ id: "format", question: "Which export format is required?", impact: "Changes the worker checks and merge result" }], tasks: [] } });
+  await planning.start(`Add an export for ${privateDetail}`);
+  const service = new CommandService(project);
+  let state = await service.detail();
+  assert.equal(state.plan.value.draft?.status, "clarifying");
+  assert.equal(state.tasks.length, 0);
+  assert.match(cli(project, home, "run", "--once").stdout, /paused: Plan revision/);
+  await planning.answer({ format: "CSV" }, await service.revision());
+  state = await service.detail();
+  assert.equal(state.plan.value.draft?.answers.format, "CSV");
+  assert.equal(state.tasks.length, 0);
+  const planRevision = state.plan.revision;
+  const checkCommand = "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').trim()==='left'?0:1)\"";
+  const added = cli(project, home, "checks", "add", "TASK-101", "--command", checkCommand, "--phase", "task",
+    "--timeout-seconds", "20", "--expected", "exit 0", "--criterion", "left export is reviewable");
+  assert.equal(added.status, 0, added.stderr);
+  const checkId = /Check ([0-9a-f-]{36})/.exec(added.stdout)?.[1];
+  assert.ok(checkId, added.stdout);
+  state = await service.detail();
+  assert.equal(state.checks[checkId].value.command, checkCommand);
+  assert.equal(state.checks[checkId].value.timeoutSeconds, 20);
+  assert.match(executionGate(state) ?? "", /Plan revision/);
+
+  const postLocal = async (command: Record<string, unknown>) => {
+    const server = createLocalApi(project);
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+      const response = await fetch(`${baseUrl}/api/commands`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(command) });
+      const result = await response.json() as Record<string, any>;
+      assert.equal(response.status, 200, JSON.stringify(result));
+      const detail = await (await fetch(`${baseUrl}/api/commands`)).json() as Record<string, any>;
+      return { result, detail };
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    }
+  };
+  const planApproval = await postLocal({ version: 1, kind: "approval.grant", expectedRevision: state.revision,
+    payload: { target: "plan", targetRevision: planRevision, actor: "user" } });
+  assert.equal(planApproval.detail.tasks.length, 2, "the approved draft becomes the executable graph");
+  assert.equal(planApproval.detail.tasks[0].spec.id, "TASK-101");
+  assert.equal(planApproval.detail.revision, (await service.detail()).revision);
+  assert.match(cli(project, home, "run", "--once").stdout, /paused: Checks revision/);
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
+  state = await service.detail();
+  assert.equal(executionGate(state), undefined);
+  assert.equal(JSON.parse(cli(project, home, "draft", "show").stdout).approved, true);
+  assert.equal((await api<Record<string, any>>(project, home, "/api/commands")).checksRevision, state.checksRevision);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const capture = join(other, "worker-capture.jsonl");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, [
+    "const fs = require('node:fs');",
+    "const id = /Complete task (TASK-\\d+)/.exec(process.argv.at(-1))[1];",
+    "if (fs.readFileSync('shared.txt','utf8').trim() !== 'base') process.exit(2);",
+    "fs.writeFileSync('shared.txt', id === 'TASK-101' ? 'left\\n' : 'right\\n');",
+    "fs.appendFileSync(process.env.ORCH_CAPTURE, JSON.stringify({id,cwd:process.cwd(),prompt:process.argv.at(-1)})+'\\n');",
+    "console.log(JSON.stringify({type:'thread.started',thread_id:'thread-' + id}));",
+    "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));",
+    "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1000,output_tokens:100}}));",
+  ].join("\n"));
+  await writeFile(join(bin, "codex.cmd"), "rem fake Codex launcher\n");
+  await writeFile(join(bin, "codex"), `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(join(bin, "codex"), 0o755);
+  const path = process.platform === "win32" ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const live = (...args: string[]) => spawnSync(process.execPath, [join(__dirname, "cli.js"), ...args], {
+    cwd: project, encoding: "utf8", timeout: 60_000, env: { ...process.env, ORCH_HOME: home, ORCH_CAPTURE: capture, PATH: path },
+  });
+  const workerCheck = "node -e \"process.exit(['left','right'].includes(require('fs').readFileSync('shared.txt','utf8').trim())?0:1)\"";
+  const signal = join(project, ".orch", "capacity.json");
+  await writeFile(signal, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1000, limitTokens: 1000000, maxConcurrent: 2 }));
+  const paused = live("run", "--executor", "codex", "--check", workerCheck);
+  assert.equal(paused.status, 0, paused.stderr);
+  const runId = /Run ID: ([0-9a-f-]{36})/.exec(paused.stdout)?.[1];
+  assert.ok(runId, paused.stdout);
+  assert.match(paused.stdout, /Provider capacity near exhaustion/);
+  assert.equal(Object.keys((await (await new WorktreeManager(project).load()).detail()).workers).length, 0);
+  assert.equal((await service.detail()).runs[runId].value.status, "paused");
+  await writeFile(signal, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1000000, limitTokens: 1000000, maxConcurrent: 2 }));
+  const resumed = live("run", "--resume", runId, "--check", workerCheck);
+  assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+  assert.equal((await service.detail()).runs[runId].value.status, "finished");
+  const manager = await new WorktreeManager(project).load();
+  const workers = (await manager.detail()).workers;
+  assert.notEqual(workers["TASK-101"].path, workers["TASK-102"].path);
+  assert.equal(workers["TASK-101"].base, base);
+  assert.equal(workers["TASK-102"].base, base);
+  assert.ok(Object.values(workers).every((record) => record.validation?.passed));
+  assert.equal((await service.detail()).checks[checkId].results.at(-1)?.status, "pass");
+  const captured = (await readFile(capture, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as { id: string; cwd: string; prompt: string });
+  assert.deepEqual(new Set(captured.map((item) => item.id)), new Set(["TASK-101", "TASK-102"]));
+  assert.ok(captured.every((item) => item.cwd === workers[item.id].path && item.prompt.includes("pinned base")));
+  assert.equal(git("rev-parse", "main"), base);
+
+  const store = new KnowledgeStore(project, home);
+  const price = { version: "example-2026-10", currency: "USD", models: {
+    "codex:gpt-6-sol": { inputPerMillion: 10, outputPerMillion: 20 }, "codex:gpt-6-luna": { inputPerMillion: 1, outputPerMillion: 2 },
+  } };
+  await writeFile(join(project, ".orch", "prices.json"), JSON.stringify(price));
+  for (const route of ["sol-medium", "luna-medium"] as const) for (let index = 0; index < 8; index++) {
+    const model = route === "sol-medium" ? "codex:gpt-6-sol" : "codex:gpt-6-luna";
+    await store.append("project", { kind: "attempt", id: `${route}-${index}-1`, scope: "project", sourceProject: "example", sourceRunId: `${route}-${index}`,
+      at: "2026-10-01T00:00:00.000Z", taskId: `HIST-${route}-${index}`, attemptNumber: 1, taskType: "analysis", difficulty: "moderate", risk: "medium",
+      route, model, passed: route === "sol-medium" || index !== 0, errors: [], simulated: false, inputTokens: 1000, outputTokens: 100,
+      latencyMs: route === "luna-medium" ? 500 : 1000 } as AttemptEntry);
+    if (route === "luna-medium" && index === 0) await store.append("project", { kind: "attempt", id: `${route}-${index}-2`, scope: "project", sourceProject: "example", sourceRunId: `${route}-${index}`,
+      at: "2026-10-01T00:00:01.000Z", taskId: `HIST-${route}-${index}`, attemptNumber: 2, taskType: "analysis", difficulty: "moderate", risk: "medium",
+      route, model, passed: true, errors: [], simulated: false, inputTokens: 1000, outputTokens: 100, latencyMs: 500 } as AttemptEntry);
+  }
+  const applied = cli(project, home, "models", "apply", "TASK-101");
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal((await service.detail()).policy.value.routing?.rules["analysis:moderate:medium"]?.alias, "luna-medium");
+  const rolled = cli(project, home, "models", "rollback", "0", "--reason", "Restore established route after review");
+  assert.equal(rolled.status, 0, rolled.stderr);
+  assert.deepEqual((await service.detail()).policy.value.routing?.rules, {});
+  assert.equal((await service.detail()).policy.value.history?.at(-1)?.cause, "rollback");
+  assert.match((await api<Record<string, any>>(project, home, "/api/workflow")).policy.history.at(-1).reason, /Restore established route/);
+
+  const integration = await manager.integrate(["TASK-101", "TASK-102"], workerCheck);
+  assert.deepEqual(integration.conflicts, ["shared.txt"]);
+  assert.equal(integration.actionId, undefined);
+  assert.equal(git("rev-parse", "main"), base);
+  await assert.rejects(manager.verifyIntegration(integration.id, workerCheck), /Resolve all integration conflicts/);
+  await writeFile(join(integration.path, "shared.txt"), "left and right\n");
+  git("-C", integration.path, "add", "shared.txt");
+  git("-C", integration.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Resolve export conflict");
+  const combinedCheck = "node -e \"process.exit(require('fs').readFileSync('shared.txt','utf8').trim()==='left and right'?0:1)\"";
+  const verified = await manager.verifyIntegration(integration.id, combinedCheck);
+  assert.equal(verified.check?.passed, true, verified.check?.output);
+  assert.ok(verified.actionId);
+  assert.notEqual(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  const mergeState = await service.detail();
+  const mergeApproval = await postLocal({ version: 1, kind: "approval.grant", expectedRevision: mergeState.revision,
+    payload: { target: "merge", actionId: verified.actionId, targetRevision: mergeState.actions[verified.actionId!].revision, actor: "user" } });
+  assert.equal(mergeApproval.detail.actions[verified.actionId!].value.artifactRevision, verified.commit);
+  assert.equal(cli(project, home, "actions", "ready", verified.actionId!).status, 0);
+  assert.equal(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  assert.equal(git("rev-parse", "main"), verified.commit);
+  assert.equal((await readFile(join(project, "shared.txt"), "utf8")).trim(), "left and right");
+
+  const lesson = await store.note("project", "For analysis tasks, inspect bounded evidence", "analysis");
+  assert.throws(() => validateSharedLessons([{ id: lesson.id, text: lesson.text, taskCategory: "analysis", updatedAt: lesson.updatedAt,
+    reviewStatus: "pending", sourceEntryId: lesson.id }]), /Invalid/);
+  await store.review(lesson.id, "approved");
+  await store.promote(lesson.id);
+  const lessons = await localSharedLessons(project, home);
+  const snapshot = await localSharedSnapshot(project);
+  assert.equal(snapshot.runs.some((run) => run.runId === runId && run.status === "finished"), true);
+  const privateBoundary = `${privateDetail}|source\\.ts|worker-capture|left and right|Restore established route`;
+  assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(privateBoundary, "i"));
+  assert.doesNotMatch(JSON.stringify(await service.sharedView()), new RegExp(privateBoundary, "i"));
+  assert.throws(() => validateSharedSnapshot({ ...snapshot, source: privateDetail }), /Unknown/);
+  const localQueries: string[] = [];
+  class CapturingPostgres extends PostgresMetadata {
+    protected query(sql: string): Promise<string> { localQueries.push(sql); return Promise.resolve(""); }
+  }
+  await new CapturingPostgres().sync(snapshot);
+  const cloudQueries: string[] = [];
+  const config = neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-example.neon.tech/dev?sslmode=require" });
+  const neon = new NeonMetadata(config, { query: async (sql) => { cloudQueries.push(sql); return ""; } });
+  await neon.sync(snapshot, lessons);
+  assert.match(localQueries.join("\n"), /INSERT INTO shared_runs/);
+  assert.match(cloudQueries.join("\n"), /shared_global_lessons/);
+  assert.doesNotMatch(localQueries.join("\n") + cloudQueries.join("\n"), new RegExp(privateBoundary + "|password", "i"));
+  await assert.rejects(neon.sync({ ...snapshot, rawOutput: privateDetail }, lessons), /Unknown/);
+  assert.equal(cloudQueries.length, 1);
+
+  const completed = await service.detail();
+  await service.execute({ version: 1, kind: "plan.draft", expectedRevision: completed.revision,
+    payload: { tasks: [{ ...tasks[0], description: "Change the completed left export" }, tasks[1]] } });
+  assert.notEqual(cli(project, home, "draft", "approve").status, 0);
+  assert.equal((await service.detail()).tasks[0].spec.description, tasks[0].description);
+}));
+
+test("[TASK-024] live route evidence creates a versioned policy, user limits override it, and rollback restores the earlier route", async () => fixture(async (project, other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Analyze a route", "--type", "analysis", "--difficulty", "moderate", "--risk", "medium").status, 0);
+  const task = new TaskGraph(JSON.parse(await readFile(join(project, ".orch", "tasks.json"), "utf8"))).ready()[0];
+  const registry = await loadRegistry(project);
+  const store = new KnowledgeStore(project, home);
+  const price = { version: "known-2026-01", currency: "USD", models: {
+    "codex:gpt-6-sol": { inputPerMillion: 10, outputPerMillion: 20 },
+    "codex:gpt-6-luna": { inputPerMillion: 1, outputPerMillion: 2 },
+  } };
+  await writeFile(join(project, ".orch", "prices.json"), JSON.stringify(price));
+  for (const route of ["sol-medium", "luna-medium"] as const) for (let index = 0; index < 8; index++) {
+    const model = route === "sol-medium" ? "codex:gpt-6-sol" : "codex:gpt-6-luna";
+    const base = { kind: "attempt" as const, scope: "project" as const, sourceProject: "fixture", sourceRunId: `${route}-${index}`,
+      at: "2026-01-01T00:00:00.000Z", taskId: `HIST-${route}-${index}`, taskType: "analysis" as const,
+      difficulty: "moderate" as const, risk: "medium" as const, route, model, simulated: false,
+      inputTokens: 1000, outputTokens: 100, latencyMs: 1000, errors: [] as string[] };
+    await store.append("project", { ...base, id: `${route}-${index}-1`, attemptNumber: 1,
+      passed: route === "sol-medium" || index !== 0 } as AttemptEntry);
+    if (route === "luna-medium" && index === 0) await store.append("project", { ...base, id: `${route}-${index}-2`, attemptNumber: 2,
+      passed: true } as AttemptEntry);
+  }
+  await store.append("project", { kind: "attempt", id: "simulated-cheap", scope: "project", sourceProject: "fixture", sourceRunId: "fake",
+    at: "2026-01-01T00:00:00.000Z", taskId: "FAKE", attemptNumber: 1, taskType: "analysis", difficulty: "moderate", risk: "medium",
+    route: "luna-medium", model: "codex:gpt-6-luna", passed: true, errors: [], simulated: true,
+    inputTokens: 1, outputTokens: 1, latencyMs: 1 } as AttemptEntry);
+  const attempts = (await store.list("project")).filter((entry): entry is AttemptEntry => entry.kind === "attempt");
+  const proposal = recommendModelRoute({ task, registry, attempts, prices: price });
+  assert.equal(proposal.recommendedAlias, "luna-medium");
+  assert.equal(proposal.candidate?.taskCount, 8);
+  assert.equal(proposal.candidate?.attemptCount, 9);
+  assert.equal(proposal.candidate?.retries, 1);
+  assert.equal(proposal.candidate?.averageLatencyMs, 1125);
+  assert.equal(proposal.candidate?.evidenceIds.includes("simulated-cheap"), false);
+
+  const limitsPath = join(project, "limits.json");
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], maxCostPerTaskUsd: 0.0005 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Budget").status, 0);
+  assert.match(JSON.parse(cli(project, home, "models", "recommend", task.id, "--prices", join(project, ".orch", "prices.json")).stdout).reason, /rejected by user limits/);
+  const rejected = cli(project, home, "models", "apply", task.id);
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /violates user limits/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], maxCostPerTaskUsd: 0.02 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Approved budget").status, 0);
+  const applied = cli(project, home, "models", "apply", task.id);
+  assert.equal(applied.status, 0, applied.stderr);
+  const service = new CommandService(project);
+  const active = (await service.detail()).policy;
+  const revision = active.value.history?.at(-1);
+  assert.equal(revision?.author, "orch");
+  assert.equal(revision?.cause, "live-outcomes");
+  assert.equal(revision?.priceVersion, "known-2026-01");
+  assert.equal(revision?.evidenceIds.length, 17);
+  assert.equal(revision?.candidate?.retries, 1);
+  assert.equal(revision?.rollbackTo, active.revision - 1);
+  assert.equal(resolveRoute(task, routeTask(task), 1, active.value.routing!, registry, attempts, price).profile.alias, "luna-medium");
+  const unavailable = structuredClone(registry);
+  unavailable.models.find((profile) => profile.alias === "luna-medium")!.enabled = false;
+  assert.equal(resolveRoute(task, routeTask(task), 1, active.value.routing!, unavailable, attempts, price).profile.alias, "sol-medium");
+  const worker = new FakeExecutor({ [task.id]: ["fail", "pass"] });
+  await orchestrate(TaskGraph.fromSpecs([task]), worker, undefined, {
+    initialRoute: (item) => resolveRoute(item, routeTask(item), 1, active.value.routing!, registry, attempts, price).route,
+    retryRoute: (item, initial, failed) => initial.label !== routeTask(item).label && failed === 1 ? routeTask(item) : null,
+  });
+  assert.deepEqual(worker.calls.map((call) => call.route), ["luna-medium", "sol-medium"]);
+  assert.match(cli(project, home, "models", "policy").stdout, /"rollbackTo"/);
+  assert.doesNotMatch(JSON.stringify(await service.sharedView()), /HIST-|known-2026|routing|evidenceIds/);
+
+  const note = await store.note("project", "Analysis route guidance from reviewed lessons", "analysis");
+  await store.review(note.id, "approved");
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\nlimits.json\n");
+  await writeFile(join(project, "README.md"), "Worker fixture\n");
+  git("add", ".gitignore", "README.md");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  assert.equal(cli(project, home, "worktrees", "base", "main", git("rev-parse", "HEAD")).status, 0);
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const capture = join(other, "capture.json");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, [
+    "const fs = require('node:fs');",
+    "fs.writeFileSync('routed.txt', 'done');",
+    "fs.writeFileSync(process.env.ORCH_CAPTURE, JSON.stringify(process.argv.slice(2)));",
+    "console.log(JSON.stringify({type:'thread.started',thread_id:'route-context'}));",
+    "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));",
+    "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1000,output_tokens:100}}));",
+  ].join("\n"));
+  await writeFile(join(bin, "codex.cmd"), "rem fake Codex launcher\n");
+  const unixLauncher = join(bin, "codex");
+  await writeFile(unixLauncher, `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(unixLauncher, 0o755);
+  const path = process.platform === "win32"
+    ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const live = spawnSync(process.execPath, [join(__dirname, "cli.js"), "run", "--executor", "codex", "--check", "node -e \"process.exit(0)\""], {
+    cwd: project, encoding: "utf8", timeout: 30_000, env: { ...process.env, ORCH_HOME: home, ORCH_CAPTURE: capture, PATH: path },
+  });
+  assert.equal(live.status, 0, live.stderr || live.stdout);
+  const argv = JSON.parse(await readFile(capture, "utf8")) as string[];
+  assert.equal(argv[argv.indexOf("-m") + 1], "gpt-6-luna");
+  assert.match(argv.at(-1) ?? "", /Analysis route guidance from reviewed lessons/);
+  assert.doesNotMatch(argv.at(-1) ?? "", /sol-medium-0-1|luna-medium-0-1/);
+  const events = await readRunEvents(project);
+  const routeEvent = events.find((event) => event.type === "route.decided");
+  const usedEvent = events.find((event) => event.type === "knowledge.selected");
+  assert.ok(routeEvent?.type === "route.decided" && usedEvent?.type === "knowledge.selected");
+  assert.equal(routeEvent.chosenAlias, "luna-medium");
+  assert.equal(routeEvent.fallbackAlias, "sol-medium");
+  assert.equal(routeEvent.observedEvidenceIds?.length, 17);
+  assert.deepEqual(usedEvent.lessonIds, [note.id]);
+  assert.equal(routeEvent.observedEvidenceIds?.includes(note.id), false);
+  assert.equal(usedEvent.lessonIds.some((id) => routeEvent.observedEvidenceIds?.includes(id)), false);
+
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], blockedModels: ["luna-medium"], maxCostPerTaskUsd: 0.02 }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Block Luna").status, 0);
+  const constrained = (await service.detail()).policy;
+  const fallback = resolveRoute(task, routeTask(task), 1, constrained.value.routing!, registry, attempts, price);
+  assert.equal(fallback.profile.alias, "sol-medium");
+  assert.match(fallback.constraint ?? "", /blocked/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["claude"] }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Provider limit").status, 0);
+  await assert.rejects(async () => resolveRoute(task, routeTask(task), 1, (await service.detail()).policy.value.routing!, registry, attempts, price), /No permitted model route/);
+  await writeFile(limitsPath, JSON.stringify({ allowedProviders: ["codex"], blockedModels: ["luna-medium"] }));
+  assert.equal(cli(project, home, "models", "limits", "--file", limitsPath, "--reason", "Restore Codex").status, 0);
+  const rolled = cli(project, home, "models", "rollback", "0", "--reason", "Restore established route");
+  assert.equal(rolled.status, 0, rolled.stderr);
+  const restored = (await service.detail()).policy;
+  assert.deepEqual(restored.value.routing?.rules, {});
+  assert.deepEqual(restored.value.routing?.limits.blockedModels, ["luna-medium"]);
+  assert.equal(restored.value.history?.at(-1)?.cause, "rollback");
+  assert.equal(resolveRoute(task, routeTask(task), 1, restored.value.routing!, registry, attempts, price).profile.alias, "sol-medium");
 }));

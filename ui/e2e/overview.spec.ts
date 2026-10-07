@@ -38,7 +38,8 @@ async function mockApi(page: Page, empty = false) {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     let body: unknown;
-    if (url.pathname === "/api/tasks") body = { tasks: empty ? [] : tasks.map((task) => ({ ...task, displayStatus: task.spec.dependsOn.length ? "blocked" : "ready" })) };
+    if (url.pathname === "/api/project") body = { registered: true, project: { revision: 1, value: { id: "fixture-project", directory: "/fixture", git: { isRepository: true } } } };
+    else if (url.pathname === "/api/tasks") body = { tasks: empty ? [] : tasks.map((task) => ({ ...task, displayStatus: task.spec.dependsOn.length ? "blocked" : "ready" })) };
     else if (url.pathname === "/api/models") body = { models: empty ? [] : models, policyVersion: 1 };
     else if (url.pathname === "/api/history") body = { attempts: empty ? [] : history };
     else if (url.pathname === "/api/knowledge") body = empty ? { lessons: [], candidates: [], retrieval: [], usedInRuns: [] } : {

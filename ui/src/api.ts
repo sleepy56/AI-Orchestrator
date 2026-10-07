@@ -83,6 +83,7 @@ export interface Lesson { id: string; scope: "project" | "global"; text: string;
 export interface Candidate { id: string; text: string; taskCategory: string; reviewStatus: string; evidence: Array<{ attemptId: string; runId: string; taskId: string }> }
 export interface KnowledgeData {
   lessons: Lesson[];
+  notes?: Lesson[];
   candidates: Candidate[];
   retrieval: Array<{ taskId: string; selections: LessonSelection[] }>;
   usedInRuns: Array<{ runId: string; taskId: string; at: string; mode: "live" | "simulated"; lessonIds: string[]; selections: LessonSelection[] }>;
@@ -119,7 +120,7 @@ async function get<T>(path: string, signal: AbortSignal): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export interface LocalCommand { version: 1; kind: "project.update" | "project.register" | "plan.add" | "plan.retry" | "plan.goal" | "plan.answer" | "plan.draft" | "check.put" | "check.result" | "action.request" | "approval.grant" | "run.record" | "policy.put" | "policy.model"; expectedRevision: number; payload: Record<string, unknown> }
+export interface LocalCommand { version: 1; kind: "project.update" | "project.register" | "plan.add" | "plan.retry" | "plan.goal" | "plan.answer" | "plan.draft" | "check.put" | "check.result" | "action.request" | "approval.grant" | "run.record" | "policy.put" | "policy.model" | "policy.limits" | "policy.route" | "policy.rollback" | "worktree.base"; expectedRevision: number; payload: Record<string, unknown> }
 export interface LocalCommandResult { revision: number; auditId: string; subjectId: string }
 
 export async function applyLocalCommand(command: LocalCommand, signal?: AbortSignal): Promise<LocalCommandResult> {
@@ -147,6 +148,30 @@ export async function requestPlanning(action: "start" | "answer", body: Record<s
   const result = await response.json() as LocalCommandResult & { error?: string };
   if (!response.ok) throw new Error(result.error ?? `API returned ${response.status}`);
   return result;
+}
+
+export interface WorkflowData {
+  revision: number;
+  base: { branch: string; commit: string } | null;
+  capacity: { availability: "known" | "unknown"; signal?: { observedAt: string; remainingTokens?: number; resetAt?: string; retryAfter?: string; maxConcurrent?: number } };
+  worktrees: {
+    workers: Record<string, { branch: string; path: string; base: string; commit?: string; validation?: { passed: boolean; command: string; output: string } }>;
+    integrations: Record<string, { id: string; taskIds: string[]; target: string; base: string; path: string; diff: string; conflicts: string[]; commit?: string; actionId?: string; merged?: boolean; check?: { command: string; passed: boolean; output: string } }>;
+  };
+  policy: { version: number; routing: { limits: { allowedProviders?: string[]; blockedModels?: string[]; maxCostPerTaskUsd?: number }; rules: Record<string, { alias: string; fallbackAlias: string }> }; history: Array<{ version: number; at: string; author: string; cause: string; reason: string; before: unknown; after: unknown; evidenceIds: string[]; priceVersion?: string; currency?: string; baseline?: RouteEvidence; candidate?: RouteEvidence; rollbackTo: number }> };
+  runs: Record<string, { value: { status: string; mode: string; reason?: string } }>;
+  jobs?: Array<{ id: string; startedAt: string; status: "running" | "finished" | "failed"; output: string; errorOutput: string; exitCode?: number | null }>;
+}
+export async function loadWorkflow(signal?: AbortSignal): Promise<WorkflowData> { return get<WorkflowData>("/api/workflow", signal ?? new AbortController().signal); }
+export async function workflowAction(body: Record<string, unknown>): Promise<unknown> {
+  const response = await fetch("/api/workflow", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const result = await response.json() as { error?: string };
+  if (!response.ok) throw new Error(result.error ?? `API returned ${response.status}`);
+  return result;
+}
+export async function knowledgeAction(body: Record<string, unknown>): Promise<void> {
+  const response = await fetch("/api/knowledge/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!response.ok) { const result = await response.json() as { error?: string }; throw new Error(result.error ?? `API returned ${response.status}`); }
 }
 
 export async function loadOverview(signal: AbortSignal, runId?: string): Promise<OverviewData> {

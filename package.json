@@ -6,18 +6,28 @@
   "bin": {
     "orch": "dist/cli.js"
   },
-  "files": ["dist", "skills", "README.md"],
+  "files": [
+    "dist",
+    "compose.yaml",
+    "migrations",
+    "skills",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "build:ui": "npm --prefix ui run build",
     "dev:ui": "npm --prefix ui run dev",
     "demo": "tsc && node dist/demo.js",
     "demo:graph": "tsc && node dist/demo.js --graph",
-    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js dist/knowledge.test.js dist/providers.test.js dist/local-api.test.js",
+    "test": "tsc && node --test dist/orchestrator.test.js dist/cli.test.js dist/knowledge.test.js dist/providers.test.js dist/local-api.test.js dist/knowledge-system.contract.test.js dist/orch-workflow.contract.test.js",
     "test:knowledge-next": "tsc && node --test dist/knowledge-system.contract.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",
+    "@types/pg": "^8.23.1",
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }
