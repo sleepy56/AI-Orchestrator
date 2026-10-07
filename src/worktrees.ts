@@ -207,16 +207,19 @@ export class WorktreeCodexExecutor implements Executor {
     private readonly taskContext: (task: TaskSpec) => string[] = () => []) {}
   async execute(task: TaskSpec, route: Route, attempt: number): Promise<ExecutionResult> {
     const lessons = this.lessons(task);
+    const resumingWorktree = Boolean((await this.manager.detail()).workers[task.id]);
     const record = await this.manager.prepare(task);
     const context = [
       `Worker branch: ${record.branch}; pinned base: ${record.base}.`,
       `Dependency commits: ${JSON.stringify(record.dependencies)}.`,
       `Project documents: ${record.contextDocuments.join(", ") || "none"}.`,
+      ...(resumingWorktree ? ["This worktree contains prior worker output. Inspect its changes and finish or verify that work before editing."] : []),
       ...this.taskContext(task),
     ];
     const executor = new CodexExecutor(record.path, this.registry, this.checkCommand, () => lessons.text,
       this.timeoutMs, async (started) => { await this.manager.markPrompt(task.id, lessons.ids); await this.onPrompt(started); }, () => context);
     const result = await executor.execute(task, route, attempt);
+    if (result.capacityReason) return { ...result, worktree: record.path };
     const service = new CommandService(this.manager.projectPath);
     const state = await service.detail();
     const checkIds = Object.entries(state.checks).filter(([, check]) => check.value.taskId === task.id && check.value.phase === "task" &&

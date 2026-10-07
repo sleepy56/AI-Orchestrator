@@ -35,6 +35,7 @@ export interface ExecutionResult {
   checkOutput?: string;
   checkExitCode?: number | null;
   retryable?: boolean;
+  capacityReason?: string;
   contextId?: string;
   worktree?: string;
   commit?: string;

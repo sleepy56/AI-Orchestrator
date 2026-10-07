@@ -10,6 +10,7 @@ export type RunEventData =
   | { type: "run.resumed" }
   | { type: "run.paused"; reason: string }
   | { type: "task.started"; taskId: string }
+  | { type: "task.interrupted"; taskId: string; reason: string }
   | { type: "knowledge.selected"; taskId: string; lessonIds: string[]; selections: Array<{ id: string; scope: "project" | "global"; reason: string }> }
   | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number }
   | { type: "attempt.started"; taskId: string; attempt: number; route: AttemptRecord["route"] }
