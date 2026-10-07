@@ -20,6 +20,7 @@ import { CapacityScheduler, readCapacity } from "./capacity";
 import { readRunEvents } from "./run-events";
 import { localSharedSnapshot, validateSharedSnapshot } from "./shared-metadata";
 import { PostgresMetadata } from "./postgres-metadata";
+import { NeonMetadata, localSharedLessons, neonConfig, validateSharedLessons } from "./neon-metadata";
 import { resolveRoute } from "./routing-policy";
 import { recommendModelRoute } from "./model-decisions";
 
@@ -1047,6 +1048,64 @@ test("[TASK-023] fresh Docker Postgres migrates and round-trips allowed run meta
     const stopped = docker("down", "-v");
     assert.equal(stopped.status, 0, stopped.stderr);
   }
+}));
+
+test("[TASK-026] Neon fake transport sends allowlisted runs and reviewed generic lessons; offline local work continues", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Private product architecture at C:\\secret\\source.ts", "--type", "refactor").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const store = new KnowledgeStore(project, home);
+  const pending = await store.note("project", "Review reusable refactor boundaries", "refactor");
+  assert.throws(() => validateSharedLessons([{ id: pending.id, text: pending.text, taskCategory: pending.taskCategory,
+    updatedAt: pending.updatedAt, reviewStatus: "pending", sourceEntryId: pending.id }]), /Invalid/);
+  assert.equal(cli(project, home, "knowledge", "review", pending.id, "--status", "approved").status, 0);
+  assert.equal(cli(project, home, "knowledge", "promote", pending.id).status, 0);
+  const lessons = await localSharedLessons(project, home);
+  assert.equal(lessons.length, 1);
+  assert.throws(() => validateSharedLessons([{ ...lessons[0], text: "Inspect C:\\secret\\source.ts" }]), /generalized/);
+  assert.throws(() => validateSharedLessons([{ ...lessons[0], rawOutput: "private" }]), /Unknown/);
+  const snapshot = await localSharedSnapshot(project);
+  const config = neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-test.neon.tech/dev?sslmode=require",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-prod.neon.tech/prod?sslmode=require" });
+  assert.equal(config.database, "dev");
+  assert.equal(neonConfig("production", { ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-prod.neon.tech/prod" }).database, "prod");
+  assert.throws(() => neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@localhost/dev" }), /Invalid/);
+  assert.throws(() => neonConfig("development", { ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:password@ep-test.neon.tech/dev",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:other@ep-test.neon.tech/dev" }), /must be separate/);
+  const queries: string[] = [];
+  const database = new NeonMetadata(config, { query: async (sql) => { queries.push(sql); return ""; } });
+  await database.migrate();
+  await database.sync(snapshot, lessons);
+  const sent = queries.join("\n");
+  assert.match(sent, /shared_global_lessons/);
+  assert.match(sent, /Review reusable refactor boundaries/);
+  assert.match(sent, /INSERT INTO shared_runs/);
+  assert.doesNotMatch(sent, /Private product|secret|source\.ts|password|source_entry|rawOutput/);
+  await assert.rejects(database.sync({ ...snapshot, privatePath: project }, lessons), /Unknown/);
+  assert.equal(queries.length, 3);
+  const offline = new NeonMetadata(config, { query: async () => { throw new Error("cloud unavailable"); } });
+  await assert.rejects(offline.sync(snapshot, lessons), /cloud unavailable/);
+  assert.deepEqual(await localSharedSnapshot(project), snapshot);
+  assert.deepEqual(await localSharedLessons(project, home), lessons);
+  assert.equal(cli(project, home, "plan", "Continue locally").status, 0);
+}));
+
+test("[TASK-026] configured Neon test database round-trips metadata and a global lesson", { skip: process.env.ORCH_TEST_NEON !== "1" }, async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "Private source context").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const store = new KnowledgeStore(project, home);
+  const note = await store.note("project", "For analysis, inspect bounded evidence", "analysis");
+  await store.review(note.id, "approved");
+  await store.promote(note.id);
+  const snapshot = await localSharedSnapshot(project);
+  const database = new NeonMetadata(neonConfig("development"));
+  await database.migrate();
+  await database.sync(snapshot, await localSharedLessons(project, home));
+  const rows = await database.runs(snapshot.projectId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].runId, snapshot.runs[0].runId);
+  assert.doesNotMatch(JSON.stringify(rows), /Private source context/);
 }));
 
 test("[TASK-024] live route evidence creates a versioned policy, user limits override it, and rollback restores the earlier route", async () => fixture(async (project, other, home) => {

@@ -118,7 +118,7 @@ function auditEvent(action: KnowledgeAudit["action"], scope: KnowledgeScope, ent
   };
 }
 
-function assertReusable(text: string): void {
+export function assertReusable(text: string): void {
   // This is a guardrail for obvious leaks; explicit human review remains required.
   if (!text.trim()) throw new Error("Global lessons cannot be empty");
   const privateDetail = /(?:[\\/]|\b\S+\.(?:ts|tsx|js|json|py|ps1|sh|md)\b|\b[\w.+-]+@[\w.-]+\b|[`{};=<>]|\bTASK-\d+\b|\b(?:const|function|import|export|class)\s+\S+|\b(?:npm|npx|node|python|pytest|git|curl)\s+\S+|\b(?:failed|failure|error|secret|token|password|credential|stack trace)\b)/i;
