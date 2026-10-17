@@ -47,3 +47,19 @@ test("missing usage and latency stay unknown instead of becoming zero", () => {
   assert.equal(formatTokens(summary), "Unknown");
   assert.equal(formatLatency(summary), "Unknown");
 });
+
+test("Luna effort profiles keep their live evidence separate", () => {
+  const profiles = ["low", "medium", "high"].map((effort) => ({
+    alias: `luna-${effort}`, provider: "codex", model: "gpt-6-luna",
+    tier: `luna-${effort}`, effort,
+  }));
+  const history = [
+    attempt({ taskId: "LOW", model: "codex:gpt-6-luna", route: "luna-low" }),
+    attempt({ taskId: "MEDIUM", model: "codex:gpt-6-luna", route: "luna-medium", passed: false }),
+    attempt({ taskId: "HIGH", model: "codex:gpt-6-luna", route: "luna-high" }),
+    attempt({ taskId: "FAKE", model: "codex:gpt-6-luna", route: "luna-high", simulated: true }),
+  ];
+  assert.deepEqual(profiles.map((profile) => realModelAttempts(history, profile).map((item) => item.taskId)), [
+    ["LOW"], ["MEDIUM"], ["HIGH"],
+  ]);
+});

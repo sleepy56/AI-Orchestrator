@@ -94,7 +94,7 @@ export function WorkerMap({ models, tasks, events, run }: Props) {
           </div>
         </div>
       </div>
-      {selected && <aside className="worker-detail" aria-live="polite" aria-label="Worker details">
+      {selected && <aside className="worker-detail" aria-live="polite" aria-label="Worker details" tabIndex={0}>
         <div className="task-detail-head"><div><div className="overline">WORKER DETAILS</div><h3>{selected.model.alias}</h3></div><span className={`status-pill ${selected.status}`}>{statusIcon[selected.status]} {selected.status}</span></div>
         <dl className="worker-facts"><div><dt>Provider</dt><dd>{selected.model.provider}</dd></div><div><dt>Model ID</dt><dd>{selected.model.model}</dd></div><div><dt>Effort</dt><dd>{selected.model.effort}</dd></div><div><dt>Current task</dt><dd>{selected.taskId ? `${selected.taskId} · attempt ${selected.attemptNumber}` : "None"}</dd></div></dl>
         {selected.route && <div className="task-detail-block"><h4>Latest route in selected run</h4><p>{selected.route.taskId} · {selected.route.reason ?? "No reason recorded."}</p>{selected.route.policyVersion && <p>Policy version {selected.route.policyVersion}</p>}</div>}

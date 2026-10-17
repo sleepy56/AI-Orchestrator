@@ -38,8 +38,8 @@ export function replayRun(run: Run, allEvents: RunEvent[], sequence: number): Re
     }
   }
   return {
-    tasks: tasks.map((task) => ({ ...task, displayStatus: displayStatus(task, byId) })),
+    tasks: tasks.map((task) => ({ ...task, displayStatus: sequence >= run.lastSequence && run.status === "possibly-interrupted" && task.status === "running" ? "possibly-interrupted" : displayStatus(task, byId) })),
     events,
-    run: { ...run, status: events.some((event) => event.type === "run.finished") ? "finished" : "running" },
+    run: { ...run, status: sequence >= run.lastSequence && run.status === "possibly-interrupted" ? "possibly-interrupted" : events.some((event) => event.type === "run.finished") ? "finished" : [...events].reverse().find((event) => event.type === "run.paused" || event.type === "run.resumed")?.type === "run.paused" ? "paused" : "running" },
   };
 }

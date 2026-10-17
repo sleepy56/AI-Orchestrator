@@ -1,0 +1,121 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { Client, QueryResult } from "pg";
+import { assertReusable, KnowledgeStore } from "./knowledge";
+import { PostgresMetadata } from "./postgres-metadata";
+import { validateSharedSnapshot } from "./shared-metadata";
+
+export type NeonEnvironment = "development" | "production";
+export interface NeonConfig {
+  environment: NeonEnvironment;
+  host: string;
+  port: string;
+  database: string;
+  user: string;
+  password: string;
+}
+export interface NeonTransport { query(sql: string, config: NeonConfig): Promise<string> }
+
+export function neonConfig(environment: NeonEnvironment, env: NodeJS.ProcessEnv = process.env): NeonConfig {
+  if (environment !== "development" && environment !== "production") throw new Error("Invalid Neon environment");
+  const setting = environment === "development" ? "ORCH_NEON_DEVELOPMENT_URL" : "ORCH_NEON_PRODUCTION_URL";
+  const otherSetting = environment === "development" ? "ORCH_NEON_PRODUCTION_URL" : "ORCH_NEON_DEVELOPMENT_URL";
+  const raw = env[setting] ?? (env.DATABASE_URL && env.NEON_BRANCH === environment ? env.DATABASE_URL : undefined);
+  if (!raw) throw new Error(env.DATABASE_URL ? `DATABASE_URL requires matching NEON_BRANCH=${environment}` : `${setting} is required for Neon ${environment}`);
+  let url: URL;
+  try { url = new URL(raw); }
+  catch { throw new Error(`Invalid ${setting}`); }
+  if (!["postgres:", "postgresql:"].includes(url.protocol) || !url.hostname.endsWith(".neon.tech") ||
+      !url.username || !url.password || !url.pathname || url.pathname === "/" || url.hash) throw new Error(`Invalid ${setting}`);
+  if (url.searchParams.has("sslmode") && !["verify-full", "require"].includes(url.searchParams.get("sslmode")!)) throw new Error(`Invalid ${setting} TLS mode`);
+  if (env[otherSetting]) {
+    let other: URL;
+    try { other = new URL(env[otherSetting]); }
+    catch { throw new Error(`Invalid ${otherSetting}`); }
+    if (url.hostname === other.hostname && url.pathname === other.pathname && (url.port || "5432") === (other.port || "5432"))
+      throw new Error("Development and production Neon databases must be separate");
+  }
+  return { environment, host: url.hostname, port: url.port || "5432", database: decodeURIComponent(url.pathname.slice(1)),
+    user: decodeURIComponent(url.username), password: decodeURIComponent(url.password) };
+}
+
+export const psqlNeonTransport: NeonTransport = {
+  async query(sql, config) {
+    const client = new Client({ host: config.host, port: Number(config.port), database: config.database,
+      user: config.user, password: config.password, ssl: { rejectUnauthorized: true }, enableChannelBinding: true });
+    try {
+      await client.connect();
+      const response = await client.query(sql);
+      const last = Array.isArray(response) ? response.at(-1) as QueryResult | undefined : response;
+      const row = last?.rows[0] as Record<string, unknown> | undefined;
+      return row ? JSON.stringify(Object.values(row)[0]) : "";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Neon query failed: ${message.replaceAll(config.password, "[redacted]")}`);
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  },
+};
+
+export interface SharedLesson { id: string; text: string; taskCategory: string; updatedAt: string; reviewStatus: "approved"; sourceEntryId: string }
+
+export function validateSharedLessons(input: unknown): SharedLesson[] {
+  if (!Array.isArray(input)) throw new Error("Invalid shared lessons");
+  const ids = new Set<string>();
+  return input.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid shared lesson");
+    const row = value as Record<string, unknown>;
+    if (Object.keys(row).some((key) => !["id", "text", "taskCategory", "updatedAt", "reviewStatus", "sourceEntryId"].includes(key))) throw new Error("Unknown shared lesson field");
+    if (typeof row.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.id) || ids.has(row.id) ||
+        typeof row.sourceEntryId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(row.sourceEntryId) || row.reviewStatus !== "approved" ||
+        !["rename", "refactor", "analysis", "test", "other"].includes(row.taskCategory as string) ||
+        typeof row.updatedAt !== "string" || !Number.isFinite(Date.parse(row.updatedAt)) ||
+        typeof row.text !== "string" || row.text.length > 1000) throw new Error("Invalid shared lesson");
+    assertReusable(row.text);
+    ids.add(row.id);
+    return { id: row.id, text: row.text, taskCategory: row.taskCategory as string, updatedAt: row.updatedAt,
+      reviewStatus: "approved" as const, sourceEntryId: row.sourceEntryId };
+  });
+}
+
+export async function localSharedLessons(project: string, home?: string): Promise<SharedLesson[]> {
+  const entries = await new KnowledgeStore(project, home).list("global");
+  return validateSharedLessons(entries.filter((entry) => entry.kind === "note" && entry.scope === "global" &&
+    entry.reviewStatus === "approved").map((entry) => {
+    if (entry.kind !== "note") throw new Error("Invalid global lesson for Neon sync");
+    return { id: entry.id, text: entry.text, taskCategory: entry.taskCategory, updatedAt: entry.updatedAt,
+      reviewStatus: entry.reviewStatus, sourceEntryId: entry.sourceEntryId };
+  }));
+}
+
+function literal(value: string): string { return `'${value.replace(/'/g, "''")}'`; }
+
+export class NeonMetadata extends PostgresMetadata {
+  constructor(readonly config: NeonConfig, private readonly transport: NeonTransport = psqlNeonTransport) { super(); }
+  protected query(sql: string): Promise<string> { return this.transport.query(sql, this.config); }
+  async diagnose(): Promise<Record<string, { present: boolean; count: number | null }>> {
+    const tables = ["schema_migrations", "shared_projects", "shared_runs", "shared_run_tasks", "shared_attempts", "shared_global_lessons"];
+    const presence = JSON.parse(await this.query(`SELECT json_build_object(${tables.map((table) => `'${table}', to_regclass('public.${table}') IS NOT NULL`).join(",")});`)) as Record<string, boolean>;
+    const result: Record<string, { present: boolean; count: number | null }> = {};
+    for (const table of tables) {
+      const present = presence[table] === true;
+      result[table] = { present, count: present ? Number(JSON.parse(await this.query(`SELECT count(*) FROM public.${table};`))) : null };
+    }
+    return result;
+  }
+  async migrate(): Promise<void> {
+    await super.migrate();
+    const source = await readFile(join(__dirname, "..", "migrations", "002_neon_lessons.sql"), "utf8");
+    await this.query(`BEGIN;\nSELECT pg_advisory_xact_lock(23023);\n${source}\nINSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;\nCOMMIT;`);
+  }
+  async sync(input: unknown, lessons: unknown = []): Promise<void> {
+    const snapshot = validateSharedSnapshot(input);
+    const reviewed = validateSharedLessons(lessons);
+    const statements = this.syncStatements(snapshot);
+    for (const lesson of reviewed) statements.push(`INSERT INTO shared_global_lessons(id,text,task_category,updated_at) VALUES (
+      ${literal(lesson.id)},${literal(lesson.text)},${literal(lesson.taskCategory)},${literal(lesson.updatedAt)})
+      ON CONFLICT(id) DO UPDATE SET text=EXCLUDED.text,task_category=EXCLUDED.task_category,updated_at=EXCLUDED.updated_at;`);
+    await this.query([...statements, "COMMIT;"].join("\n"));
+  }
+}

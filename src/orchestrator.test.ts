@@ -74,6 +74,8 @@ test("exhausted attempts fail the task and leave dependents blocked", async () =
 
 test("router raises effort for risk, difficulty, and work type", () => {
   assert.equal(routeTask(task("T1")).label, "luna-low");
+  assert.equal(routeTask({ ...task("T2"), difficulty: "moderate" }).label, "luna-medium");
+  assert.equal(routeTask({ ...task("T3"), difficulty: "hard" }).label, "luna-high");
   assert.equal(routeTask({ ...task("T2"), type: "refactor" }).label, "sol-medium");
   assert.equal(routeTask({ ...task("T3"), risk: "high" }).label, "sol-high");
 });

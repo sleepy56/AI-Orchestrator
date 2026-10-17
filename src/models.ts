@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { dirname, join } from "node:path";
 import { Effort, Route } from "./types";
 
@@ -26,6 +27,8 @@ export function defaultRegistry(): ModelRegistry {
     policyVersion: 1,
     models: [
       { alias: "luna-low", provider: "codex", model: "gpt-6-luna", tier: "luna-low", effort: "low", enabled: true, weight: 1 },
+      { alias: "luna-medium", provider: "codex", model: "gpt-6-luna", tier: "luna-medium", effort: "medium", enabled: true, weight: 1 },
+      { alias: "luna-high", provider: "codex", model: "gpt-6-luna", tier: "luna-high", effort: "high", enabled: true, weight: 1 },
       { alias: "sol-medium", provider: "codex", model: "gpt-6-sol", tier: "sol-medium", effort: "medium", enabled: true, weight: 1 },
       { alias: "sol-high", provider: "codex", model: "gpt-6-sol", tier: "sol-high", effort: "high", enabled: true, weight: 1 },
       { alias: "sol-xhigh", provider: "codex", model: "gpt-6-sol", tier: "sol-xhigh", effort: "xhigh", enabled: true, weight: 1 },
@@ -57,6 +60,16 @@ export async function loadRegistry(project: string): Promise<ModelRegistry> {
   if (new Set(registry.models.map((model) => model.alias)).size !== registry.models.length) {
     throw new Error("Duplicate model alias in .orch/models.json");
   }
+  // Older registries predate these routes. Preserve every configured profile and
+  // only fill a route that has no profile of its own.
+  for (const effort of ["medium", "high"] as const) {
+    const tier = `luna-${effort}` as const;
+    if (registry.models.some((model) => model.tier === tier)) continue;
+    const profile = defaultRegistry().models.find((model) => model.tier === tier)!;
+    let alias = profile.alias;
+    for (let suffix = 2; registry.models.some((model) => model.alias === alias); suffix++) alias = `${profile.alias}-${suffix}`;
+    registry.models.push({ ...profile, alias });
+  }
   return registry;
 }
 
@@ -67,7 +80,7 @@ export async function saveRegistry(project: string, registry: ModelRegistry): Pr
   const temporary = `${target}.${process.pid}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(registry, null, 2)}\n`, { flag: "wx" });
-    await rename(temporary, target);
+    await renameWithRetry(temporary, target);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -88,6 +101,7 @@ export function validateProfile(model: ModelProfile): void {
   if (typeof model.model !== "string" || (model.enabled && !model.model.trim())) throw new Error(`Invalid model ID for ${model.alias}`);
   if (!/^(luna|sol)-(low|medium|high|xhigh)$/.test(model.tier)) throw new Error(`Invalid tier for ${model.alias}`);
   if (!["low", "medium", "high", "xhigh"].includes(model.effort)) throw new Error(`Invalid effort for ${model.alias}`);
+  if (model.tier.split("-")[1] !== model.effort) throw new Error(`Model tier and effort differ for ${model.alias}`);
   if (typeof model.enabled !== "boolean" || !Number.isFinite(model.weight) || model.weight < 0 || model.weight > 10) {
     throw new Error(`Invalid availability or weight for ${model.alias}`);
   }

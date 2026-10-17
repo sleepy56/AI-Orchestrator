@@ -24,7 +24,7 @@ test("run events persist in order and local API exposes read-only project state"
       "run.started", "task.started", "route.decided", "attempt.started", "attempt.finished", "task.finished", "run.finished",
     ]);
     assert.equal(events[0].type === "run.started" && events[0].mode, "simulated");
-    assert.equal(events[2].type === "route.decided" && events[2].reason, "medium risk, moderate difficulty, refactor, or analysis");
+    assert.equal(events[2].type === "route.decided" && events[2].reason, "medium risk, refactor, or analysis");
     assert.equal(events[4].type === "attempt.finished" && events[4].simulated, true);
 
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -36,12 +36,23 @@ test("run events persist in order and local API exposes read-only project state"
       return { status: response.status, body: await response.json() as Record<string, any> };
     };
     const taskState = await get("/api/tasks");
+    const preflight = await get("/api/preflight");
+    assert.equal(preflight.status, 200);
+    assert.equal(preflight.body.directory, project);
+    assert.equal(preflight.body.mode, "simulated");
+    assert.deepEqual(preflight.body.blockers, []);
+    assert.equal((await get("/api/preflight?executor=wrong")).status, 400);
+    const livePreflight = await get("/api/preflight?executor=codex&check=npm%20test");
+    assert.equal(livePreflight.body.mode, "live");
+    assert.deepEqual(livePreflight.body.verification, ["npm test"]);
+    assert.ok(livePreflight.body.blockers.some((item: string) => item.includes("Git repository")));
     assert.deepEqual(taskState.body.tasks.map((task: { displayStatus: string }) => task.displayStatus), ["completed", "ready"]);
     const models = await get("/api/models");
     assert.equal(models.body.models[0].alias, "luna-low");
     assert.equal(models.body.observations[0].liveAttempts, 0);
     const history = await get("/api/history");
     assert.equal(history.body.attempts[0].simulated, true);
+    assert.equal(history.body.attempts[0].sourceRunId, events[0].runId);
     const runs = await get("/api/runs");
     assert.equal(runs.body.runs[0].status, "finished");
     const timeline = await get(`/api/runs/${events[0].runId}/events?after=2`);

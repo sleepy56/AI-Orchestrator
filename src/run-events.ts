@@ -2,13 +2,18 @@ import { open, readFile, mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AttemptRecord, TaskSnapshot } from "./types";
+import type { RouteLimits } from "./routing-policy";
 
 export type RunMode = "simulated" | "live";
 
 export type RunEventData =
   | { type: "run.started"; mode: RunMode; tasks: TaskSnapshot["tasks"]; policyVersion: number }
+  | { type: "run.resumed" }
+  | { type: "run.paused"; reason: string }
   | { type: "task.started"; taskId: string }
-  | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number }
+  | { type: "task.interrupted"; taskId: string; reason: string }
+  | { type: "knowledge.selected"; taskId: string; lessonIds: string[]; selections: Array<{ id: string; scope: "project" | "global"; reason: string }> }
+  | { type: "route.decided"; taskId: string; attempt: number; route: AttemptRecord["route"]; reason: string; policyVersion: number; candidates: Array<{ alias: string; model: string; weight: number }>; chosenAlias?: string; chosenModel?: string; preferenceWeight?: number; fallbackAlias?: string; constraint?: string; userLimits?: RouteLimits; observedEvidenceIds?: string[] }
   | { type: "attempt.started"; taskId: string; attempt: number; route: AttemptRecord["route"] }
   | { type: "attempt.finished"; taskId: string; attempt: AttemptRecord; simulated: boolean }
   | { type: "task.finished"; taskId: string; status: "completed" | "failed"; failureReason?: string }
@@ -21,11 +26,11 @@ export function runEventsPath(project: string): string {
 }
 
 export class RunEventWriter {
-  readonly runId = randomUUID();
+  readonly runId: string;
   private sequence = 0;
   private pending: Promise<void> = Promise.resolve();
 
-  constructor(readonly project: string) {}
+  constructor(readonly project: string, runId?: string, sequence = 0) { this.runId = runId ?? randomUUID(); this.sequence = sequence; }
 
   append(data: RunEventData): Promise<void> {
     const event: RunEvent = { ...data, runId: this.runId, sequence: ++this.sequence, at: new Date().toISOString() };
@@ -66,13 +71,30 @@ export async function readRunEvents(project: string): Promise<RunEvent[]> {
   });
 }
 
+export async function localRunLiveness(project: string, activeJob = false): Promise<"active" | "stopped" | "unknown"> {
+  if (activeJob) return "active";
+  let value: string;
+  try { value = (await readFile(join(project, ".orch", "run.lock"), "utf8")).trim(); }
+  catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return "stopped";
+    throw error;
+  }
+  const pid = Number(value);
+  if (!Number.isSafeInteger(pid) || pid < 1) return "unknown";
+  try { process.kill(pid, 0); return "active"; }
+  catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") return "stopped";
+    return "unknown";
+  }
+}
+
 export interface RunSummary {
   runId: string;
   mode: RunMode;
   startedAt: string;
   finishedAt?: string;
   lastSequence: number;
-  status: "running" | "finished";
+  status: "running" | "paused" | "finished";
 }
 
 export function summarizeRuns(events: RunEvent[]): RunSummary[] {
@@ -84,6 +106,8 @@ export function summarizeRuns(events: RunEvent[]): RunSummary[] {
       const run = runs.get(event.runId);
       if (!run) continue;
       run.lastSequence = event.sequence;
+      if (event.type === "run.paused") run.status = "paused";
+      if (event.type === "run.resumed") run.status = "running";
       if (event.type === "run.finished") {
         run.status = "finished";
         run.finishedAt = event.at;

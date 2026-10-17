@@ -50,9 +50,10 @@ interface Props {
   run?: Run;
   selectedId?: string;
   onSelect: (id: string) => void;
+  onOpen?: (id: string, trigger: HTMLButtonElement) => void;
 }
 
-export function TaskGraph({ tasks, events, run, selectedId, onSelect }: Props) {
+export function TaskGraph({ tasks, events, run, selectedId, onSelect, onOpen }: Props) {
   const nodeRefs = useRef(new Map<string, HTMLButtonElement>());
   const graph: ReturnType<typeof layout> = useMemo(() => layout(tasks), [tasks]);
   const byId: Map<string, Task> = useMemo(() => new Map(tasks.map((task) => [task.spec.id, task])), [tasks]);
@@ -113,7 +114,7 @@ export function TaskGraph({ tasks, events, run, selectedId, onSelect }: Props) {
             style={{ left: x, top: y, width: nodeWidth, height: nodeHeight }}
             aria-pressed={task.spec.id === selectedId}
             aria-label={`${task.spec.id}: ${task.spec.description}. ${task.displayStatus}. ${task.spec.dependsOn.length ? `Depends on ${task.spec.dependsOn.join(", ")}` : "No dependencies"}`}
-            onClick={() => onSelect(task.spec.id)}
+            onClick={(event) => { onSelect(task.spec.id); onOpen?.(task.spec.id, event.currentTarget); }}
             onKeyDown={(event) => moveFocus(event, task.spec.id)}
           ><span className="graph-node-top"><strong>{task.spec.id}</strong><span className={`status-pill ${task.displayStatus}`}>{task.displayStatus}</span></span><span className="graph-node-description">{task.spec.description}</span></button>)}
         </div>

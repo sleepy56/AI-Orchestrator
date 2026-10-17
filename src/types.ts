@@ -32,7 +32,13 @@ export interface ExecutionResult {
   outputTokens?: number;
   latencyMs?: number;
   checkCommand?: string;
+  checkOutput?: string;
+  checkExitCode?: number | null;
   retryable?: boolean;
+  capacityReason?: string;
+  contextId?: string;
+  worktree?: string;
+  commit?: string;
 }
 
 export interface ValidationResult {
@@ -50,6 +56,11 @@ export interface AttemptRecord {
   outputTokens?: number;
   latencyMs?: number;
   checkCommand?: string;
+  checkOutput?: string;
+  checkExitCode?: number | null;
+  contextId?: string;
+  worktree?: string;
+  commit?: string;
 }
 
 export type TaskStatus = "pending" | "running" | "completed" | "failed";
