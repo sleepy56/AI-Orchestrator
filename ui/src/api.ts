@@ -1,4 +1,4 @@
-export type TaskStatus = "pending" | "ready" | "running" | "blocked" | "completed" | "failed";
+export type TaskStatus = "pending" | "ready" | "running" | "possibly-interrupted" | "blocked" | "completed" | "failed";
 
 export interface Task {
   spec: { id: string; description: string; dependsOn: string[]; type: string; difficulty: string; risk: string };
@@ -6,6 +6,7 @@ export interface Task {
   displayStatus: TaskStatus;
   attempts: Attempt[];
   failureReason?: string;
+  nextAction?: string;
 }
 
 export interface Attempt {
@@ -51,7 +52,7 @@ export interface Run {
   startedAt: string;
   finishedAt?: string;
   lastSequence: number;
-  status: "running" | "paused" | "finished";
+  status: "running" | "possibly-interrupted" | "paused" | "finished";
 }
 
 export interface RunEvent {
@@ -94,12 +95,16 @@ export interface ProposalData { priceVersion?: string; proposals: Array<{ taskId
 
 export interface OverviewData {
   tasks: Task[];
+  planning: PlanningState;
+  workflow: WorkflowData;
   models: Model[];
   policyVersion: number;
   attempts: HistoryAttempt[];
   runs: Run[];
   selectedRun?: Run;
   events: RunEvent[];
+  recentRun?: Run;
+  recentEvents: RunEvent[];
   knowledge: KnowledgeData;
   proposals: ProposalData;
 }
@@ -155,11 +160,12 @@ export interface WorkflowData {
   base: { branch: string; commit: string } | null;
   capacity: { availability: "known" | "unknown"; signal?: { observedAt: string; remainingTokens?: number; resetAt?: string; retryAfter?: string; maxConcurrent?: number } };
   worktrees: {
-    workers: Record<string, { branch: string; path: string; base: string; commit?: string; validation?: { passed: boolean; command: string; output: string } }>;
+    workers: Record<string, { branch: string; path: string; base: string; commit?: string; verification?: { passed: boolean; reason?: string }; validation?: { passed: boolean; reason?: string; command?: string; output?: string } }>;
     integrations: Record<string, { id: string; taskIds: string[]; target: string; base: string; path: string; diff: string; conflicts: string[]; commit?: string; actionId?: string; merged?: boolean; check?: { command: string; passed: boolean; output: string } }>;
   };
   policy: { version: number; routing: { limits: { allowedProviders?: string[]; blockedModels?: string[]; maxCostPerTaskUsd?: number }; rules: Record<string, { alias: string; fallbackAlias: string }> }; history: Array<{ version: number; at: string; author: string; cause: string; reason: string; before: unknown; after: unknown; evidenceIds: string[]; priceVersion?: string; currency?: string; baseline?: RouteEvidence; candidate?: RouteEvidence; rollbackTo: number }> };
   runs: Record<string, { value: { status: string; mode: string; reason?: string } }>;
+  runtime?: { liveness: "active" | "stopped" | "unknown" };
   jobs?: Array<{ id: string; startedAt: string; status: "running" | "finished" | "failed"; output: string; errorOutput: string; exitCode?: number | null }>;
 }
 export async function loadWorkflow(signal?: AbortSignal): Promise<WorkflowData> { return get<WorkflowData>("/api/workflow", signal ?? new AbortController().signal); }
@@ -174,25 +180,56 @@ export async function knowledgeAction(body: Record<string, unknown>): Promise<vo
   if (!response.ok) { const result = await response.json() as { error?: string }; throw new Error(result.error ?? `API returned ${response.status}`); }
 }
 
+export type StorageEnvironment = "development" | "production";
+export interface StorageState {
+  environments: Record<StorageEnvironment, {
+    configuration: { configured: boolean; destination: { host: string; database: string } | null; error: string | null };
+    pendingLocalChanges: boolean;
+    lastSuccess?: { at: string; counts?: { runs: number; lessons: number } } | null;
+    lastConnectivityCheck?: { at: string; ok: boolean; error?: string; tables?: Record<string, { present: boolean; count: number | null }> } | null;
+    latestFailedAttempt?: { at: string; error: string } | null;
+    operation?: { action: "diagnose" | "sync"; ok: boolean };
+  }>;
+}
+export async function loadStorage(signal?: AbortSignal): Promise<StorageState> {
+  const state = await get<StorageState>("/api/storage", signal ?? new AbortController().signal);
+  if (!state?.environments || !["development", "production"].every((environment) => state.environments[environment as StorageEnvironment]?.configuration && typeof state.environments[environment as StorageEnvironment].pendingLocalChanges === "boolean")) {
+    throw new Error("Storage state unavailable");
+  }
+  return state;
+}
+export async function storageAction(action: "diagnose" | "sync", environment: StorageEnvironment): Promise<void> {
+  const response = await fetch("/api/storage/" + action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ environment }) });
+  const result = await response.json().catch(() => ({})) as { error?: string; operation?: { ok: boolean }; latestFailedAttempt?: { error: string }; lastConnectivityCheck?: { error: string } };
+  if (!response.ok || result.operation?.ok === false) throw new Error(result.error ?? result.latestFailedAttempt?.error ?? result.lastConnectivityCheck?.error ?? ("API returned " + response.status + " for /api/storage/" + action));
+}
+
 export async function loadOverview(signal: AbortSignal, runId?: string): Promise<OverviewData> {
-  const [taskResult, modelResult, runResult, historyResult, knowledge, proposals] = await Promise.all([
+  const [taskResult, modelResult, runResult, historyResult, knowledge, proposals, planning, workflow] = await Promise.all([
     get<{ tasks: Task[] }>("/api/tasks", signal),
     get<{ models: Model[]; policyVersion?: number }>("/api/models", signal),
     get<{ runs: Run[] }>("/api/runs", signal),
     get<{ attempts: HistoryAttempt[] }>("/api/history", signal),
     get<KnowledgeData>("/api/knowledge", signal),
     get<ProposalData>("/api/model-proposals", signal),
+    get<PlanningState>("/api/commands", signal),
+    get<WorkflowData>("/api/workflow", signal),
   ]);
-  const selectedRun = runResult.runs.find((run) => run.runId === runId) ?? runResult.runs.find((run) => run.status === "running") ?? runResult.runs[0];
-  const events: RunEvent[] = [];
-  if (selectedRun) {
+  const recentRun = runResult.runs[0];
+  const selectedRun = runResult.runs.find((run) => run.runId === runId) ?? recentRun;
+  const readEvents = async (run?: Run): Promise<RunEvent[]> => {
+    const events: RunEvent[] = [];
+    if (!run) return events;
     let after = 0;
-    while (after < selectedRun.lastSequence) {
-      const page = await get<{ events: RunEvent[] }>(`/api/runs/${selectedRun.runId}/events?after=${after}`, signal);
+    while (after < run.lastSequence) {
+      const page = await get<{ events: RunEvent[] }>(`/api/runs/${run.runId}/events?after=${after}`, signal);
       if (page.events.length === 0) break;
       events.push(...page.events);
       after = page.events[page.events.length - 1].sequence;
     }
-  }
-  return { tasks: taskResult.tasks, models: modelResult.models, policyVersion: modelResult.policyVersion ?? 1, attempts: historyResult.attempts, runs: runResult.runs, selectedRun, events, knowledge, proposals };
+    return events;
+  };
+  const events = await readEvents(selectedRun);
+  const recentEvents = recentRun?.runId === selectedRun?.runId ? events : await readEvents(recentRun);
+  return { tasks: taskResult.tasks, planning, workflow, models: modelResult.models, policyVersion: modelResult.policyVersion ?? 1, attempts: historyResult.attempts, runs: runResult.runs, selectedRun, events, recentRun, recentEvents, knowledge, proposals };
 }

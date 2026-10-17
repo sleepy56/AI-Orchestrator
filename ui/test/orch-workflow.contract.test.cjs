@@ -173,6 +173,10 @@ test("[TASK-018] planning view shows consequential questions and reviewable task
   assert.match(question, /Which export format\?/);
   assert.match(question, /Changes parser dependencies/);
   assert.match(question, /Answer and draft/);
+  const stale = renderToStaticMarkup(React.createElement(module.exports.PlanningView, { initialState: { ...base, plan: { revision: 2, value: { draft: { ...base.plan.value.draft,
+    questions: [{ id: "Q1", question: "Can you restore read access to the workspace?", impact: "Local file inspection is failing" }] } } } } }));
+  assert.match(stale, /project file access failure/);
+  assert.doesNotMatch(stale, /Answer and draft/);
   const review = renderToStaticMarkup(React.createElement(module.exports.PlanningView, { initialState: { ...base, plan: { revision: 3, value: { draft: { ...base.plan.value.draft,
     status: "review", questions: [], tasks: [{ id: "TASK-101", description: "Implement CSV export", risk: "high", difficulty: "hard", workerProfile: "sol-high", dependsOn: [], acceptanceCriteria: ["Exports CSV headers"], areas: ["src/export"], context: ["README.md"], verification: ["Run export tests"] }] } } } } }));
   assert.match(review, /Exports CSV headers/);

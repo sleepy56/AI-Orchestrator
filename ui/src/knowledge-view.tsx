@@ -25,7 +25,7 @@ export function KnowledgeView({ knowledge, proposals, tasks, onChanged }: Props)
   return <>
     <div className="page-intro"><div><div className="eyebrow">REVIEW AND ROUTING</div><h1>Knowledge</h1><p>Reviewed lessons, pending candidates, and recorded run use.</p></div></div>
     {error && <p className="error-banner" role="alert">{error}</p>}
-    <section className="panel knowledge-panel"><h2>Project lesson review</h2><p>Only approved, generalized project lessons can be promoted globally. Review the wording for identifying details first.</p>
+    <section className="panel knowledge-panel"><div className="overline">LOCAL REVIEW</div><h2>Project lesson review</h2><p>Only approved, generalized project lessons can be promoted globally. Review the wording for identifying details first.</p>
       <form onSubmit={(event) => { event.preventDefault(); void act(editing ? { operation: "edit", id: editing, text } : { operation: "add", text, taskCategory: category }); }}>
         <label htmlFor="lesson-text">{editing ? `Edit ${editing}` : "New project lesson"}</label><textarea id="lesson-text" value={text} onChange={(event) => setText(event.target.value)} required rows={3} />
         {!editing && <><label htmlFor="lesson-category">Task category</label><select id="lesson-category" value={category} onChange={(event) => setCategory(event.target.value)}>{["other", "rename", "refactor", "analysis", "test"].map((item) => <option key={item} value={item}>{item}</option>)}</select></>}

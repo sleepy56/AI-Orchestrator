@@ -56,3 +56,14 @@ test("completion unblocks dependent tasks at the correct event", () => {
   assert.equal(replayRun(run, completed, 5).tasks[1].displayStatus, "blocked");
   assert.equal(replayRun(run, completed, 6).tasks[1].displayStatus, "ready");
 });
+
+test("latest interrupted status does not rewrite historical replay or source events", () => {
+  const interrupted = { ...run, status: "possibly-interrupted", lastSequence: 3 };
+  const partial = events.slice(0, 3);
+  const before = JSON.stringify(partial);
+  assert.equal(replayRun(interrupted, partial, 2).run.status, "running");
+  const latest = replayRun(interrupted, partial, 3);
+  assert.equal(latest.run.status, "possibly-interrupted");
+  assert.equal(latest.tasks[0].displayStatus, "possibly-interrupted");
+  assert.equal(JSON.stringify(partial), before);
+});
