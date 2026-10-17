@@ -7,7 +7,7 @@ export interface CheckReportRow { id: string; taskId?: string; criterion?: strin
 export interface CheckReport { rows: CheckReportRow[]; counts: Record<CheckReportRow["status"], number> }
 
 export async function checkReport(service: CommandService, taskId?: string): Promise<CheckReport> {
-  const state = await service.detail();
+  const state = await service.readOnlyDetail();
   const draft = state.plan.value.draft;
   const rows: CheckReportRow[] = Object.entries(state.checks).filter(([, record]) =>
     record.value.planRevision === undefined || record.value.planRevision === state.plan.revision).filter(([, record]) =>

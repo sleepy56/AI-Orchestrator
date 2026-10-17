@@ -20,12 +20,13 @@ export class CodexPlanningModel implements PlanningModel {
       `Goal: ${input.goal}`,
       `Context documents: ${JSON.stringify(input.documents)}. Available scripts: ${JSON.stringify(input.scripts)}.`,
       input.answers ? `Answers to earlier questions: ${JSON.stringify(input.answers)}. Do not ask further questions; use reasonable assumptions and draft now.` : "Ask at most three questions only if different answers would materially change task scope, dependencies, risk, or acceptance criteria. Each question must explain that impact. If a safe assumption suffices, draft now.",
-      "Return only JSON with keys questions and tasks. questions is an array of {id,question,impact}. If questions are needed, tasks must be []. Otherwise questions must be [] and tasks is a nonempty array.",
+      "Return only JSON with keys questions and tasks. questions is an array of {id,question,impact}. If questions are needed, tasks must be []. Otherwise questions must be [] and tasks is a nonempty array. Questions are for product decisions, never for tool failures or access to local files. If repository or document inspection fails, return {\"error\":\"Cannot inspect project files: <brief reason>\",\"questions\":[],\"tasks\":[]} instead.",
       "Each task: {id,description,type,difficulty,risk,dependsOn,acceptanceCriteria,areas,workerProfile,context,verification}. IDs are unique TASK-NNN. Dependencies refer only to tasks in this draft and form an acyclic graph. type: rename|refactor|analysis|test|other; difficulty: easy|moderate|hard|extreme; risk: low|medium|high|critical. acceptanceCriteria, areas, context, verification are nonempty arrays of concrete strings. workerProfile is a proposed model/effort, not an assignment.",
       "Give one verification entry per acceptance criterion in the same order. For behavior that can be tested, use 'command: <focused test command>' and name the behavior the test must assert. If a new test is needed, add testArtifacts: [{name,content}] to that task and refer to it as {{test:name}} in its command, for example 'command: node --test {{test:export.test.js}}'. Write assertions against actual project behavior, not placeholders or always-passing tests. Generated test files are saved under .orch/generated-tests at a plan-revision path for review. For visual or judgment criteria, use 'review: <concrete review procedure>'. Never claim a broad build proves an unrelated behavior.",
       "Use only read-only file inspection and searches. Do not run builds, tests, installs, deployments, or workers, and do not modify files. Keep the plan limited to the goal.",
     ].join("\n");
-    const result = await runCodex(launch.command, [...launch.argsPrefix, "exec", "--json", "--ephemeral", "--sandbox", "read-only", "-C", this.project, prompt], this.project, 120_000);
+    const result = await runCodex(launch.command, [...launch.argsPrefix, "exec", "--json", "--ephemeral", "--sandbox", "read-only", "-C", this.project, prompt], this.project, 120_000,
+      (status) => console.error(`Planner: ${status}`));
     if (result.timedOut || result.exitCode !== 0) throw new Error(`Planner failed: ${result.stderr || "no response"}`);
     return jsonReply(result.finalResponse);
   }
@@ -34,7 +35,13 @@ export class CodexPlanningModel implements PlanningModel {
 function proposal(value: unknown): { questions: PlanningQuestion[]; tasks: DraftTask[] } {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Planner response needs an object");
   const result = value as Record<string, unknown>;
+  if (typeof result.error === "string" && result.error.trim()) throw new Error(`Planner could not inspect the project: ${result.error.trim()}`);
   if (!Array.isArray(result.questions) || !Array.isArray(result.tasks)) throw new Error("Planner response needs questions and tasks arrays");
+  if (result.questions.some((question: unknown) => question && typeof question === "object" &&
+    /(?:restore|grant|provide|fix|enable).{0,100}(?:read access|file access|workspace access|repository tree|document contents)|(?:read access|file access|workspace access).{0,100}(?:fail|denied|blocked)/i.test(
+      String((question as Record<string, unknown>).question ?? "") + " " + String((question as Record<string, unknown>).impact ?? "")))) {
+    throw new Error("Planner could not inspect project files. Check the API terminal for the Codex file-access error; no draft was saved.");
+  }
   return { questions: result.questions as PlanningQuestion[], tasks: result.tasks as DraftTask[] };
 }
 

@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { dirname, join } from "node:path";
 import { Effort, Route } from "./types";
 
@@ -79,7 +80,7 @@ export async function saveRegistry(project: string, registry: ModelRegistry): Pr
   const temporary = `${target}.${process.pid}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(registry, null, 2)}\n`, { flag: "wx" });
-    await rename(temporary, target);
+    await renameWithRetry(temporary, target);
   } finally {
     await rm(temporary, { force: true });
   }

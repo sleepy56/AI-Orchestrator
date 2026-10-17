@@ -3,26 +3,30 @@ import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
+import fs from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { KnowledgeStore, AttemptEntry } from "./knowledge";
 import { createLocalApi } from "./local-api";
 import { loadRegistry, selectModel } from "./models";
 import { routeTask } from "./router";
 import { TaskSpec } from "./types";
-import { actionGate, CommandService, executionGate } from "./command-service";
+import { actionGate, CommandService, executionGate, taskVerificationGate } from "./command-service";
 import { PlanningWorkflow } from "./planning";
-import { checkReport } from "./checks";
+import { checkReport, runCheck } from "./checks";
 import { FakeExecutor } from "./executor";
 import { orchestrate } from "./orchestrator";
 import { TaskGraph } from "./scheduler";
 import { WorktreeManager } from "./worktrees";
 import { CapacityScheduler, readCapacity } from "./capacity";
-import { readRunEvents } from "./run-events";
+import { localRunLiveness, readRunEvents, RunEventWriter } from "./run-events";
 import { localSharedSnapshot, validateSharedSnapshot } from "./shared-metadata";
 import { PostgresMetadata } from "./postgres-metadata";
 import { NeonMetadata, localSharedLessons, neonConfig, validateSharedLessons } from "./neon-metadata";
+import { neonEnvironmentFile, StorageService } from "./storage";
 import { resolveRoute } from "./routing-policy";
 import { recommendModelRoute } from "./model-decisions";
+import { executionPreflight } from "./preflight";
 
 test("[TASK-025] CLI and local UI API share revisions, approvals, runs, learning, and private detail only while connected", async () => fixture(async (project, _other, home) => {
   const privateTask = "Implement private product architecture at src/private.ts";
@@ -201,6 +205,118 @@ test("[TASK-022] a paused run safely recovers an interrupted task before startin
   assert.ok(events.some((event) => event.type === "task.interrupted"));
 }));
 
+test("[IMP-TASK-004] interrupted worker edits require an explicit choice and preserve prior evidence", async () => fixture(async (project, _other, home) => {
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\nignored.txt\n");
+  await writeFile(join(project, "README.md"), "dependency base\n");
+  git("add", ".");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(cli(project, home, "init").status, 0);
+  assert.equal(cli(project, home, "plan", "First edit").status, 0);
+  assert.equal(cli(project, home, "plan", "Second edit").status, 0);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+  const snapshotPath = join(project, ".orch", "tasks.json");
+  const graph = new TaskGraph(JSON.parse(await readFile(snapshotPath, "utf8")));
+  const manager = await new WorktreeManager(project).load();
+  const first = await manager.prepare(graph.ready()[0]);
+  const second = await manager.prepare(graph.ready()[1]);
+  await writeFile(join(first.path, "partial.txt"), "keep this edit\n");
+  await writeFile(join(second.path, "README.md"), "discard this edit\n");
+  await writeFile(join(second.path, "partial.txt"), "discard this file\n");
+  await writeFile(join(second.path, "ignored.txt"), "discard this ignored file\n");
+  await manager.finish("TASK-001", "prior-context-1", "prior check", false, "prior failure");
+  await manager.finish("TASK-002", "prior-context-2", "prior check", false, "prior failure");
+  for (const task of graph.ready()) graph.markRunning(task.id);
+  graph.get("TASK-001").attempts.push({ attempt: 1, route: routeTask(graph.get("TASK-001").spec),
+    validation: { passed: false, errors: ["prior failure"] }, worktree: first.path });
+  await writeFile(snapshotPath, JSON.stringify(graph.snapshot()));
+
+  const events = new RunEventWriter(project);
+  await events.append({ type: "run.started", mode: "live", tasks: graph.snapshot().tasks, policyVersion: 1 });
+  const eventsPath = join(project, ".orch", "runs.jsonl");
+  const beforeEvents = await readFile(eventsPath, "utf8");
+  const beforeSnapshot = await readFile(snapshotPath, "utf8");
+  const beforeRevision = await new CommandService(project).revision();
+  const lockPath = join(project, ".orch", "run.lock");
+  await writeFile(lockPath, String(process.pid));
+  const active = await api<{ tasks: Array<{ displayStatus: string }> }>(project, home, "/api/tasks");
+  assert.equal(active.tasks[0].displayStatus, "running");
+  assert.equal((await api<{ runtime: { liveness: string } }>(project, home, "/api/workflow")).runtime.liveness, "active");
+  assert.equal((await api<{ runs: Array<{ status: string }> }>(project, home, "/api/runs")).runs[0].status, "running");
+  assert.match(cli(project, home, "retry", "TASK-001", "--discard").stderr, /run may still be active/);
+  assert.equal(await readFile(join(first.path, "partial.txt"), "utf8"), "keep this edit\n");
+
+  await writeFile(lockPath, "invalid");
+  assert.equal((await api<{ runtime: { liveness: string } }>(project, home, "/api/workflow")).runtime.liveness, "unknown");
+  assert.match(cli(project, home, "retry", "TASK-001", "--discard").stderr, /run may still be active/);
+  await writeFile(lockPath, "999999");
+  const interrupted = await api<{ tasks: Array<{ displayStatus: string; nextAction: string }> }>(project, home, "/api/tasks");
+  assert.equal(interrupted.tasks[0].displayStatus, "possibly-interrupted");
+  assert.match(interrupted.tasks[0].nextAction, /Inspect worker changes/);
+  const runs = await api<{ runs: Array<{ status: string; nextAction: string }> }>(project, home, "/api/runs");
+  assert.equal(runs.runs[0].status, "possibly-interrupted");
+  assert.match(runs.runs[0].nextAction, /reconcile/);
+  assert.equal((await api<{ runtime: { liveness: string } }>(project, home, "/api/workflow")).runtime.liveness, "stopped");
+  assert.equal(await readFile(eventsPath, "utf8"), beforeEvents);
+  assert.equal(await readFile(snapshotPath, "utf8"), beforeSnapshot);
+  assert.equal(await new CommandService(project).revision(), beforeRevision);
+  assert.match(cli(project, home, "retry", "TASK-001").stderr, /explicit preserve or discard/);
+  assert.equal(await readFile(snapshotPath, "utf8"), beforeSnapshot);
+
+  await rm(lockPath);
+  assert.equal(await localRunLiveness(project), "stopped");
+  assert.equal(await localRunLiveness(project, true), "active", "an active local job keeps a worker running before its lock appears");
+  assert.equal((await api<{ tasks: Array<{ displayStatus: string }> }>(project, home, "/api/tasks")).tasks[0].displayStatus, "possibly-interrupted");
+  assert.equal(cli(project, home, "retry", "TASK-001", "--preserve").status, 0);
+  const workerStatePath = join(project, ".orch", "worktrees.json");
+  const workerState = await readFile(workerStatePath, "utf8");
+  const misdirected = JSON.parse(workerState);
+  misdirected.workers["TASK-002"].path = first.path;
+  await writeFile(workerStatePath, JSON.stringify(misdirected));
+  assert.match(cli(project, home, "retry", "TASK-002", "--discard").stderr, /not its recorded worktree/);
+  assert.equal(await readFile(join(first.path, "partial.txt"), "utf8"), "keep this edit\n");
+  await writeFile(workerStatePath, workerState);
+  assert.equal(cli(project, home, "retry", "TASK-002", "--discard").status, 0);
+  assert.equal(await readFile(join(first.path, "partial.txt"), "utf8"), "keep this edit\n");
+  await assert.rejects(readFile(join(second.path, "partial.txt"), "utf8"), { code: "ENOENT" });
+  await assert.rejects(readFile(join(second.path, "ignored.txt"), "utf8"), { code: "ENOENT" });
+  assert.equal((await readFile(join(second.path, "README.md"), "utf8")).replace(/\r\n/g, "\n"), "dependency base\n");
+  assert.equal(await readFile(join(project, "README.md"), "utf8"), "dependency base\n");
+  assert.equal(git("-C", second.path, "rev-parse", "HEAD"), second.base);
+  const retained = (await (await new WorktreeManager(project).load()).detail()).workers;
+  for (const [id, decision, worker] of [["TASK-001", "preserve", first], ["TASK-002", "discard", second]] as const) {
+    assert.equal(retained[id].path, worker.path);
+    assert.equal(retained[id].reconciliations?.[0].decision, decision);
+    assert.equal(retained[id].reconciliations?.[0].applied, true);
+    assert.equal(retained[id].reconciliations?.[0].priorBase, worker.base);
+    assert.equal(retained[id].reconciliations?.[0].priorHead, worker.base);
+    assert.match(retained[id].reconciliations?.[0].priorDiffId ?? "", /^[0-9a-f]{64}$/);
+    assert.equal(retained[id].reconciliations?.[0].priorValidation?.output, "prior failure");
+  }
+  assert.notEqual(retained["TASK-001"].reconciliations?.[0].priorDiffId, retained["TASK-002"].reconciliations?.[0].priorDiffId);
+  assert.equal(retained["TASK-001"].validation, undefined);
+  assert.equal(retained["TASK-002"].validation, undefined);
+  const after = new TaskGraph(JSON.parse(await readFile(snapshotPath, "utf8")));
+  assert.equal(after.get("TASK-001").status, "pending");
+  assert.equal(after.get("TASK-001").attempts[0].validation.errors[0], "prior failure");
+}));
+
+test("[IMP-TASK-004] API reads do not initialize missing command history", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const statePath = join(project, ".orch", "commands.v1.json");
+  await rm(statePath);
+  for (const endpoint of ["/api/project", "/api/commands", "/api/commands/shared", "/api/shared/runs", "/api/storage", "/api/checks", "/api/workflow", "/api/tasks", "/api/model-proposals"]) {
+    await api(project, home, endpoint);
+    await assert.rejects(readFile(statePath, "utf8"), { code: "ENOENT" }, endpoint);
+  }
+}));
+
 test("[TASK-022] a live capacity pause persists and resumes the same run after remeasurement", async () => fixture(async (project, other, home) => {
   const git = (...args: string[]) => {
     const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
@@ -246,9 +362,10 @@ test("[TASK-022] a live capacity pause persists and resumes the same run after r
   await writeFile(join(worker.path, "partial.txt"), "unfinished work\n");
   const unsafe = run("run", "--resume", runId, "--check", "node -e \"process.exit(0)\"");
   assert.notEqual(unsafe.status, 0);
-  assert.match(unsafe.stderr, /inspect changes, then use orch retry/);
+  assert.match(unsafe.stderr, /Inspect changes, then use orch retry/);
   assert.equal((await readFile(join(worker.path, "partial.txt"), "utf8")).trim(), "unfinished work");
-  assert.equal(cli(project, home, "retry", task.id).status, 0);
+  assert.match(cli(project, home, "retry", task.id).stderr, /explicit preserve or discard/);
+  assert.equal(cli(project, home, "retry", task.id, "--preserve").status, 0);
   assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
   await writeFile(signalPath, JSON.stringify({ provider: "codex", observedAt: new Date().toISOString(), remainingTokens: 1_000_000, limitTokens: 1_000_000, maxConcurrent: 2 }));
   const resumed = run("run", "--resume", runId, "--check", "node -e \"process.exit(0)\"");
@@ -348,10 +465,13 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.equal(right.base, base);
   assert.deepEqual(left.contextDocuments, ["README.md"]);
   await writeFile(join(left.path, "shared.txt"), "left\n");
+  await mkdir(join(left.path, ".orch"));
+  await writeFile(join(left.path, ".orch", "validation.log"), "Private worker evidence\n");
   assert.equal((await readFile(join(right.path, "shared.txt"), "utf8")).trim(), "base");
   await writeFile(join(right.path, "shared.txt"), "right\n");
   await manager.finish(tasks[0].id, "thread-left", "node check.js", true, "pass");
   await manager.finish(tasks[1].id, "thread-right", "node check.js", true, "pass");
+  assert.ok(!git("-C", left.path, "ls-tree", "-r", "--name-only", "HEAD").split(/\r?\n/).some((file) => file.startsWith(".orch/")));
   const detail = await manager.detail();
   assert.deepEqual(detail.workers[tasks[0].id].lessonIds, ["lesson-left"]);
   assert.equal(detail.workers[tasks[0].id].contextId, "thread-left");
@@ -378,7 +498,7 @@ test("[TASK-021] sibling worktrees stay isolated, retain context and lessons, an
   assert.equal(git("rev-parse", "main"), base);
 }));
 
-test("[TASK-021] dependency bases and combined checks produce an exact merge request before target changes", async () => fixture(async (project, _other, home) => {
+test("[TASK-021][IMP-TASK-002] dependency bases and current integration checks gate the exact merge request", async () => fixture(async (project, _other, home) => {
   const git = (...args: string[]) => {
     const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
@@ -394,6 +514,14 @@ test("[TASK-021] dependency bases and combined checks produce an exact merge req
   assert.equal(cli(project, home, "plan", "Write left").status, 0);
   assert.equal(cli(project, home, "plan", "Write right").status, 0);
   assert.equal(cli(project, home, "plan", "Build on left", "--after", "TASK-001").status, 0);
+  const service = new CommandService(project);
+  const registered = await service.execute({ version: 1, kind: "check.put", expectedRevision: await service.revision(), payload: {
+    phase: "integration", command: "node -e \"process.exit(require('fs').existsSync('dependent.txt')?0:1)\"",
+    cwd: ".", timeoutSeconds: 20, expected: "exit 0" } });
+  const artifactCheck = await service.execute({ version: 1, kind: "check.put", expectedRevision: await service.revision(), payload: {
+    phase: "integration", command: "node -e \"process.exit(require('fs').existsSync('integration.txt')?0:1)\"",
+    cwd: ".", timeoutSeconds: 20, expected: "exit 0" } });
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
   assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
   const tasks = (await new CommandService(project).detail()).tasks.map((entry) => entry.spec);
   const manager = await new WorktreeManager(project).load();
@@ -412,14 +540,28 @@ test("[TASK-021] dependency bases and combined checks produce an exact merge req
   const command = "node -e \"const fs=require('fs');process.exit(['left.txt','right.txt','dependent.txt'].every(x=>fs.existsSync(x))?0:1)\"";
   const integrated = await manager.integrate([tasks[2].id, tasks[1].id], command);
   assert.deepEqual(integrated.conflicts, []);
-  assert.equal(integrated.check?.passed, true, integrated.check?.output);
+  assert.equal(integrated.check?.passed, false);
+  assert.equal((await service.detail()).checks[registered.subjectId].results.at(-1)?.status, "pass");
+  assert.equal((await service.detail()).checks[artifactCheck.subjectId].results.at(-1)?.status, "fail");
+  assert.equal(integrated.check?.checks?.[registered.subjectId], (await service.detail()).checks[registered.subjectId].results.at(-1)?.id);
   assert.match(integrated.diff, /dependent\.txt/);
-  assert.ok(integrated.actionId);
+  assert.equal(integrated.actionId, undefined);
+  await writeFile(join(integrated.path, "integration.txt"), "checked\n");
+  git("-C", integrated.path, "add", "integration.txt");
+  git("-C", integrated.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Complete integration artifact");
+  const verified = await manager.verifyIntegration(integrated.id, command);
+  assert.equal(verified.check?.passed, true, verified.check?.output);
+  assert.equal(verified.check?.checks?.[artifactCheck.subjectId], (await service.detail()).checks[artifactCheck.subjectId].results.at(-1)?.id);
+  assert.ok(verified.actionId);
   assert.equal(git("rev-parse", "main"), base);
-  assert.notEqual(cli(project, home, "worktrees", "merge", integrated.actionId!).status, 0);
-  assert.equal(cli(project, home, "actions", "approve", integrated.actionId!).status, 0);
-  assert.equal(cli(project, home, "worktrees", "merge", integrated.actionId!).status, 0);
-  assert.equal(git("rev-parse", "main"), integrated.commit);
+  assert.notEqual(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  assert.equal(cli(project, home, "actions", "approve", verified.actionId!).status, 0);
+  await service.execute({ version: 1, kind: "check.result", expectedRevision: await service.revision(), payload: {
+    id: registered.subjectId, checkRevision: 1, status: "skipped", reason: "Rerun on integration" } });
+  await assert.rejects(manager.merge(verified.actionId!), /Integration check.*skipped/);
+  assert.equal((await manager.verifyIntegration(integrated.id, command)).check?.passed, true);
+  assert.equal(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  assert.equal(git("rev-parse", "main"), verified.commit);
   assert.equal((await readFile(join(project, "dependent.txt"), "utf8")).trim(), "dependent");
 }));
 
@@ -433,6 +575,26 @@ test("[TASK-020] a new task start stops when an approval gate appears during a r
   assert.equal(result.paused, "Checks revision 2 awaits approval");
   assert.deepEqual(fake.calls.map((call) => call.taskId), ["TASK-001"]);
   assert.equal(graph.get("TASK-002").status, "pending");
+});
+
+test("[IMP-TASK-002] a dependent task stays pending while review is outstanding and resumes afterward", async () => {
+  const graph = TaskGraph.fromSpecs([
+    { id: "TASK-001", description: "Produce output", type: "other", difficulty: "easy", risk: "low", dependsOn: [] },
+    { id: "TASK-002", description: "Use reviewed output", type: "other", difficulty: "easy", risk: "low", dependsOn: ["TASK-001"] },
+  ]);
+  const fake = new FakeExecutor();
+  let reviewed = false;
+  const options = { beforeTask: (task: TaskSpec) => task.id === "TASK-002" && !reviewed ? "Dependency verification pending" : undefined };
+  const first = await orchestrate(graph, fake, undefined, options);
+  assert.equal(first.paused, "Dependency verification pending");
+  assert.equal(graph.get("TASK-001").status, "completed");
+  assert.equal(graph.get("TASK-002").status, "pending");
+  assert.deepEqual(fake.calls.map((call) => call.taskId), ["TASK-001"]);
+  reviewed = true;
+  const resumed = await orchestrate(graph, fake, undefined, options);
+  assert.equal(resumed.paused, undefined);
+  assert.equal(graph.get("TASK-002").status, "completed");
+  assert.deepEqual(fake.calls.map((call) => call.taskId), ["TASK-001", "TASK-002"]);
 });
 
 test("[TASK-020] run pauses durably for exact plan and check approvals and resumes after CLI approval", async () => fixture(async (project, _other, home) => {
@@ -530,7 +692,7 @@ test("[TASK-020] merge and deployment approvals are bound to action revision and
   await assert.rejects(service.requireActionApproval(deploymentId), /Plan or checks changed/);
 }));
 
-test("[TASK-020] a draft with missing check suggestions still has an approvable check set revision", async () => fixture(async (project, _other, home) => {
+test("[IMP-TASK-002] check approval names uncovered draft criteria and accepts a covering check", async () => fixture(async (project, _other, home) => {
   assert.equal(cli(project, home, "init").status, 0);
   const service = new CommandService(project);
   await service.execute({ version: 1, kind: "plan.goal", expectedRevision: await service.revision(), payload: { goal: "Inspect result", questions: [], tasks: [{
@@ -539,9 +701,28 @@ test("[TASK-020] a draft with missing check suggestions still has an approvable 
   const state = await service.detail();
   assert.equal(state.checksRevision, 1);
   assert.equal(cli(project, home, "draft", "approve").status, 0);
+  const rejected = cli(project, home, "checks", "approve");
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /TASK-101 has no check for acceptance criterion: Result is useful/);
+  const server = createLocalApi(project);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/commands`, { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version: 1, kind: "approval.grant",
+        expectedRevision: await service.revision(), payload: { target: "checks", targetRevision: state.checksRevision, actor: "user" } }) });
+    assert.equal(response.status, 400);
+    assert.match(JSON.stringify(await response.json()), /Result is useful/);
+  } finally { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); }
+  assert.equal(Object.values((await service.detail()).approvals).some((entry) => entry.value.target === "checks"), false);
+  assert.match(executionGate(await service.detail()) ?? "", /Checks revision/);
+  assert.ok((await checkReport(service)).counts.missing >= 1);
+  await service.execute({ version: 1, kind: "check.put", expectedRevision: await service.revision(), payload: {
+    taskId: "TASK-101", criterion: "Result is useful", phase: "review", procedure: "Inspect result", expected: "Named reviewer confirms result", timeoutSeconds: 60 } });
   assert.equal(cli(project, home, "checks", "approve").status, 0);
   assert.equal(executionGate(await service.detail()), undefined);
-  assert.ok((await checkReport(service)).counts.missing >= 1);
+  assert.equal((await checkReport(service, "TASK-101")).counts.missing, 0);
 }));
 
 test("[TASK-019] baseline failure stays separate from task evidence, CLI checks execute, and revisions distinguish outcomes", async () => fixture(async (project, _other, home) => {
@@ -563,7 +744,8 @@ test("[TASK-019] baseline failure stays separate from task evidence, CLI checks 
   let state = await service.detail();
   const id = Object.keys(state.checks).find((key) => state.checks[key].value.taskId === "TASK-001")!;
   assert.equal(state.checks[id].value.timeoutSeconds, 5);
-  assert.equal(cli(project, home, "checks", "run", id).status, 0);
+  const checked = cli(project, home, "checks", "run", id);
+  assert.equal(checked.status, 0, checked.stderr || checked.stdout);
   report = await checkReport(service, "TASK-001");
   assert.equal(report.rows.find((row) => row.id === id)?.status, "pass");
   assert.ok(report.rows.some((row) => row.phase === "baseline" && row.status === "fail"));
@@ -605,12 +787,14 @@ test("[TASK-019] draft criteria generate focused executable and named review che
   const review = report.rows.find((row) => row.procedure)!;
   assert.match(executable.command!, /plan-r1\/TASK-101\/export\.test\.js/);
   assert.equal(await readFile(join(project, ".orch", "generated-tests", "plan-r1", "TASK-101", "export.test.js"), "utf8"), artifact);
-  assert.equal(cli(project, home, "checks", "run", executable.id).status, 0);
+  const checked = cli(project, home, "checks", "run", executable.id);
+  assert.equal(checked.status, 0, checked.stderr || checked.stdout);
   assert.equal((await checkReport(service, task.id)).rows.find((row) => row.id === executable.id)?.status, "pass");
   await assert.rejects(service.execute({ version: 1, kind: "check.result", expectedRevision: await service.revision(), payload: { id: review.id, checkRevision: review.revision, status: "pass" } }), /named reviewer/);
-  assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "A. Reviewer").status, 0);
+  assert.match(cli(project, home, "checks", "review", review.id, "--reviewer", "A. Reviewer").stderr, /waits for successful worker output/);
   report = await checkReport(service, task.id);
-  assert.equal(report.counts.pass, 2);
+  assert.equal(report.counts.pass, 1);
+  assert.equal(report.counts.unrun, 1);
   const state = await service.detail();
   await service.execute({ version: 1, kind: "plan.draft", expectedRevision: state.revision, payload: { tasks: [{ ...task, acceptanceCriteria: ["Export includes headers", "Export layout remains readable"], testArtifacts: [{ name: "export.test.js", content: `${artifact}// revised test\n` }] }] } });
   report = await checkReport(service, task.id);
@@ -621,6 +805,80 @@ test("[TASK-019] draft criteria generate focused executable and named review che
   assert.match(await readFile(join(project, ".orch", "generated-tests", "plan-r2", "TASK-101", "export.test.js"), "utf8"), /revised test/);
   const local = await api<{ counts: { unrun: number } }>(project, home, "/api/checks?taskId=TASK-101");
   assert.equal(local.counts.unrun, 2);
+}));
+
+test("[IMP-TASK-002] worker output awaits named review and current evidence before integration or merge", async () => fixture(async (project, _other, home) => {
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\n");
+  await writeFile(join(project, "README.md"), "Fixture context\n");
+  git("add", ".");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(cli(project, home, "init").status, 0);
+  const service = new CommandService(project);
+  const command = "node -e \"process.exit(require('fs').readFileSync('result.txt','utf8').trim()==='done'?0:1)\"";
+  const task = { id: "TASK-101", description: "Produce reviewable output", type: "other", difficulty: "easy", risk: "low", dependsOn: [],
+    acceptanceCriteria: ["Output passes command", "Output is readable"], areas: ["result.txt"], workerProfile: "sol-medium", context: ["README.md"],
+    verification: [`command: ${command}`, "review: Inspect result.txt"] };
+  await service.execute({ version: 1, kind: "plan.goal", expectedRevision: await service.revision(), payload: { goal: "Review output", questions: [], tasks: [task] } });
+  assert.equal(cli(project, home, "draft", "approve").status, 0);
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
+  assert.equal(cli(project, home, "worktrees", "base", "main", base).status, 0);
+  const rows = (await checkReport(service, task.id)).rows;
+  const executable = rows.find((row) => row.command)!;
+  const review = rows.find((row) => row.procedure)!;
+  const manager = await new WorktreeManager(project).load();
+  const worker = await manager.prepare((await service.detail()).tasks[0].spec);
+  assert.match(cli(project, home, "checks", "review", review.id, "--reviewer", "A. Reviewer").stderr, /waits for successful worker output/);
+  await writeFile(join(worker.path, "result.txt"), "done\n");
+  const result = await runCheck(service, executable.id, worker.path);
+  assert.equal(result.status, "pass");
+  await manager.finish(task.id, "thread-review", command, true, "Worker command passed", { [executable.id]: result.id! });
+  const record = (await service.detail()).tasks[0];
+  await writeFile(join(project, ".orch", "tasks.json"), JSON.stringify({ tasks: [{ ...record, status: "completed" }] }));
+  assert.equal((await manager.detail()).workers[task.id].verification?.passed, false);
+  assert.match((await manager.detail()).workers[task.id].verification?.reason ?? "", /review.*unrun/);
+  assert.match(cli(project, home, "status").stdout, /Worker output complete; verification pending/);
+  const tasks = await api<{ tasks: Array<{ verification: { passed: boolean; reason: string } }> }>(project, home, "/api/tasks");
+  assert.equal(tasks.tasks[0].verification.passed, false);
+  assert.match(tasks.tasks[0].verification.reason, /unrun/);
+  await assert.rejects(manager.integrate([task.id], command), /review.*unrun/);
+  assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "A. Reviewer").status, 0);
+  assert.equal((await manager.detail()).workers[task.id].verification?.passed, true);
+  assert.equal(taskVerificationGate(await service.detail(), task.id, (await manager.detail()).workers[task.id]), undefined);
+  const integration = await manager.integrate([task.id], command);
+  assert.equal(integration.check?.passed, true);
+  assert.ok(integration.actionId);
+  await assert.rejects(manager.merge(integration.actionId!), /awaits approval/);
+  assert.equal(cli(project, home, "actions", "approve", integration.actionId!).status, 0);
+  const priorAction = integration.actionId;
+  await writeFile(join(integration.path, "extra.txt"), "Manual integration change\n");
+  git("-C", integration.path, "add", "extra.txt");
+  git("-C", integration.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Change integration without a conflict");
+  await manager.verifyIntegration(integration.id, command);
+  assert.notEqual(integration.actionId, priorAction);
+  assert.match(cli(project, home, "actions", "approve", integration.actionId!).stderr, /named pass after conflict resolution/);
+  assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "Integration Reviewer").status, 0);
+  assert.equal(cli(project, home, "actions", "approve", integration.actionId!).status, 0);
+  await service.execute({ version: 1, kind: "check.result", expectedRevision: await service.revision(), payload: {
+    id: review.id, checkRevision: review.revision, status: "skipped", reason: "Needs another inspection" } });
+  await assert.rejects(manager.merge(integration.actionId!), /review.*skipped/);
+  assert.notEqual(cli(project, home, "actions", "ready", integration.actionId!).status, 0);
+  assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "B. Reviewer").status, 0);
+  await service.execute({ version: 1, kind: "check.result", expectedRevision: await service.revision(), payload: {
+    id: executable.id, checkRevision: executable.revision, status: "skipped", reason: "Needs a rerun" } });
+  await assert.rejects(manager.merge(integration.actionId!), /check.*skipped/);
+  assert.equal((await runCheck(service, executable.id, worker.path)).status, "pass");
+  await assert.rejects(manager.merge(integration.actionId!), /no current worker-output evidence/);
+  await service.execute({ version: 1, kind: "plan.draft", expectedRevision: await service.revision(), payload: { tasks: [task] } });
+  assert.equal((await checkReport(service, task.id)).rows.find((row) => row.command)?.status, "unrun");
+  assert.match(taskVerificationGate(await service.detail(), task.id, (await manager.detail()).workers[task.id]) ?? "", /unrun/);
+  assert.equal(git("rev-parse", "main"), base);
 }));
 
 test("[TASK-018] consequential clarification yields an editable acyclic review draft without starting workers", async () => fixture(async (project, _other, home) => {
@@ -679,6 +937,18 @@ test("[TASK-018] consequential clarification yields an editable acyclic review d
   const revisedRun = cli(project, home, "run", "--once");
   assert.equal(revisedRun.status, 0, revisedRun.stderr);
   assert.match(revisedRun.stdout, /paused/);
+}));
+
+test("planner file-access failures are errors and leave the existing draft unchanged", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const service = new CommandService(project);
+  const before = await service.detail();
+  const accessQuestion = { questions: [{ id: "Q1", question: "Can you restore read access to the workspace or provide the repository tree?", impact: "Local file inspection is failing" }], tasks: [] };
+  await assert.rejects(new PlanningWorkflow(project, { propose: async () => accessQuestion }).start("Build the backend"), /could not inspect project files/);
+  await assert.rejects(new PlanningWorkflow(project, { propose: async () => ({ error: "Cannot inspect project files: access denied", questions: [], tasks: [] }) }).start("Build the backend"), /could not inspect the project/);
+  const after = await service.detail();
+  assert.equal(after.revision, before.revision);
+  assert.equal(after.plan.value.draft, before.plan.value.draft);
 }));
 
 async function fixture(work: (a: string, b: string, home: string) => Promise<void>) {
@@ -1093,6 +1363,126 @@ test("[TASK-026] Neon fake transport sends allowlisted runs and reviewed generic
   assert.equal(cli(project, home, "plan", "Continue locally").status, 0);
 }));
 
+test("[IMP-TASK-003] receipts distinguish never synced, stale local data, failed sync, and environments", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const env = { ORCH_HOME: home, ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:secret@ep-dev.neon.tech/dev",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:secret@ep-prod.neon.tech/prod" };
+  let time = Date.parse("2026-01-01T00:00:00.000Z");
+  let fail = false;
+  const queries: string[] = [];
+  const store = new StorageService(project, env, { query: async (sql) => {
+    queries.push(sql);
+    if (fail) throw new Error(`connection failed: ${env.ORCH_NEON_DEVELOPMENT_URL}`);
+    return "";
+  } }, () => { time += 10; return time; });
+  const never = await store.status("development");
+  assert.equal(never.pendingLocalChanges, true);
+  assert.equal(never.lastSuccess, null);
+  assert.equal(never.lastConnectivityCheck, null);
+  assert.equal(queries.length, 0);
+  const synced = await store.sync("development");
+  assert.deepEqual(synced.operation, { action: "sync", ok: true });
+  assert.equal(synced.pendingLocalChanges, false);
+  assert.equal(synced.lastSuccess?.counts.runs, 0);
+  assert.equal(synced.lastSuccess?.durationMs, 10);
+  assert.equal(synced.latestFailedAttempt, null);
+  assert.equal((await store.status("production")).lastSuccess, null);
+  assert.equal(cli(project, home, "plan", "New local data").status, 0);
+  assert.equal(cli(project, home, "run", "--once").status, 0);
+  const stale = await store.status("development");
+  assert.equal(stale.pendingLocalChanges, true);
+  assert.notEqual(stale.local.digest, synced.lastSuccess?.digest);
+  fail = true;
+  const failed = await store.sync("development");
+  assert.deepEqual(failed.operation, { action: "sync", ok: false });
+  assert.equal(failed.lastSuccess?.digest, synced.lastSuccess?.digest);
+  assert.equal(failed.latestFailedAttempt?.error, "Neon connection failed");
+  assert.equal(failed.pendingLocalChanges, true);
+  assert.equal(failed.lastConnectivityCheck, null);
+  assert.equal((await store.status("production")).latestFailedAttempt, null);
+  assert.doesNotMatch(JSON.stringify(failed), /secret|postgresql:\/\//);
+  assert.equal(cli(project, home, "plan", "Local work still available").status, 0);
+}));
+
+test("[IMP-TASK-003] diagnostic is read-only, reports table counts, and isolates configuration", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const envFile = join(project, "neon.env");
+  await writeFile(envFile, "DATABASE_URL='postgresql://dev:secret@ep-dev.neon.tech/dev'\nNEON_BRANCH=development\nORCH_HOME=ignored\n");
+  const env = await neonEnvironmentFile(envFile, { ORCH_HOME: home });
+  assert.equal(env.ORCH_HOME, home);
+  assert.equal(neonConfig("development", env).database, "dev");
+  const cliStatus = cli(project, home, "shared", "neon", "status", "--environment", "development", "--env-file", envFile);
+  assert.equal(cliStatus.status, 0, cliStatus.stderr);
+  assert.equal(JSON.parse(cliStatus.stdout).configuration.destination.database, "dev");
+  assert.throws(() => neonConfig("production", env), /matching NEON_BRANCH=production/);
+  assert.throws(() => neonConfig("invalid" as "development", env), /Invalid Neon environment/);
+  assert.throws(() => neonConfig("production", { ...env, NEON_BRANCH: "production",
+    ORCH_NEON_PRODUCTION_URL: "postgresql://prod:secret@ep-dev.neon.tech/dev",
+    ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:secret@ep-dev.neon.tech/dev" }), /must be separate/);
+  const queries: string[] = [];
+  const store = new StorageService(project, env, { query: async (sql) => {
+    queries.push(sql);
+    return sql.includes("to_regclass") ? JSON.stringify({ schema_migrations: true, shared_projects: true,
+      shared_runs: true, shared_run_tasks: true, shared_attempts: true, shared_global_lessons: false }) : "2";
+  } }, () => Date.parse("2026-01-01T00:00:00.000Z"));
+  const result = await store.diagnose("development");
+  assert.equal(result.configuration.destination?.host, "ep-dev.neon.tech");
+  assert.deepEqual(result.operation, { action: "diagnose", ok: true });
+  assert.equal(result.lastConnectivityCheck?.ok, true);
+  assert.deepEqual(result.lastConnectivityCheck?.tables?.shared_runs, { present: true, count: 2 });
+  assert.deepEqual(result.lastConnectivityCheck?.tables?.shared_global_lessons, { present: false, count: null });
+  assert.equal(result.lastSuccess, null);
+  assert.ok(queries.every((sql) => /^SELECT /i.test(sql)));
+  assert.equal(queries.length, 6);
+  assert.doesNotMatch(JSON.stringify(result), /secret|postgresql:\/\//);
+  const mismatched = await store.diagnose("production");
+  assert.equal(mismatched.lastConnectivityCheck?.ok, false);
+  assert.match(mismatched.lastConnectivityCheck?.error ?? "", /matching NEON_BRANCH/);
+  assert.equal(queries.length, 6);
+}));
+
+test("[IMP-TASK-003] storage API defaults offline and redacts endpoint failures", async () => fixture(async (project, _other, home) => {
+  assert.equal(cli(project, home, "init").status, 0);
+  const env = { ORCH_HOME: home, ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:secret@ep-dev.neon.tech/dev" };
+  let queries = 0;
+  const server = createLocalApi(project, (supplied) => new StorageService(project, { ...env, ...supplied, ORCH_HOME: home },
+    { query: async () => { queries++; throw new Error(env.ORCH_NEON_DEVELOPMENT_URL); } }));
+  try {
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const base = `http://127.0.0.1:${address.port}`;
+    const offline = await (await fetch(`${base}/api/storage`)).json() as Record<string, any>;
+    assert.equal(queries, 0);
+    assert.equal(offline.environments.development.pendingLocalChanges, true);
+    assert.equal(offline.environments.production.configuration.configured, false);
+    const response = await fetch(`${base}/api/storage/diagnose`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment: "development" }) });
+    assert.equal(response.status, 200);
+    const diagnostic = await response.json() as Record<string, any>;
+    assert.equal(diagnostic.lastConnectivityCheck.ok, false);
+    assert.equal(diagnostic.lastConnectivityCheck.error, "Neon connection failed");
+    assert.equal(queries, 1);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /secret|postgresql:\/\//);
+    const sync = await fetch(`${base}/api/storage/sync`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment: "development" }) });
+    assert.equal(sync.status, 200);
+    const failedSync = await sync.json() as Record<string, any>;
+    assert.equal(failedSync.latestFailedAttempt.error, "Neon connection failed");
+    assert.equal(failedSync.lastSuccess, null);
+    assert.doesNotMatch(JSON.stringify(failedSync), /secret|postgresql:\/\//);
+    assert.equal(queries, 2);
+    const invalid = await fetch(`${base}/api/storage/sync`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment: "production", url: env.ORCH_NEON_DEVELOPMENT_URL }) });
+    assert.equal(invalid.status, 400);
+    assert.doesNotMatch(await invalid.text(), /secret|postgresql:\/\//);
+    assert.equal(queries, 2);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+}));
+
 test("[TASK-026] configured Neon test database round-trips metadata and a global lesson", { skip: process.env.ORCH_TEST_NEON !== "1" }, async () => fixture(async (project, _other, home) => {
   assert.equal(cli(project, home, "init").status, 0);
   assert.equal(cli(project, home, "plan", "Private source context").status, 0);
@@ -1230,6 +1620,8 @@ test("[TASK-027] example project completes clarification, approved live work, co
   assert.equal(workers["TASK-102"].base, base);
   assert.ok(Object.values(workers).every((record) => record.validation?.passed));
   assert.equal((await service.detail()).checks[checkId].results.at(-1)?.status, "pass");
+  const reviews = await Promise.all(["TASK-101", "TASK-102"].map(async (id) => (await checkReport(service, id)).rows.find((row) => row.procedure)!));
+  for (const review of reviews) assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "Fixture Reviewer").status, 0);
   const captured = (await readFile(capture, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line) as { id: string; cwd: string; prompt: string });
   assert.deepEqual(new Set(captured.map((item) => item.id)), new Set(["TASK-101", "TASK-102"]));
   assert.ok(captured.every((item) => item.cwd === workers[item.id].path && item.prompt.includes("pinned base")));
@@ -1272,6 +1664,16 @@ test("[TASK-027] example project completes clarification, approved live work, co
   assert.equal(verified.check?.passed, true, verified.check?.output);
   assert.ok(verified.actionId);
   assert.notEqual(cli(project, home, "worktrees", "merge", verified.actionId!).status, 0);
+  assert.match(cli(project, home, "actions", "approve", verified.actionId!).stderr, /named pass after conflict resolution/);
+  for (const review of reviews) assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "Conflict Reviewer").status, 0);
+  const priorActionId = verified.actionId;
+  await writeFile(join(integration.path, "resolution.txt"), "Reviewed integration artifact\n");
+  git("-C", integration.path, "add", "resolution.txt");
+  git("-C", integration.path, "-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Update resolved artifact");
+  await manager.verifyIntegration(integration.id, combinedCheck);
+  assert.notEqual(verified.actionId, priorActionId);
+  assert.match(cli(project, home, "actions", "approve", verified.actionId!).stderr, /named pass after conflict resolution/);
+  for (const review of reviews) assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "Final Reviewer").status, 0);
   const mergeState = await service.detail();
   const mergeApproval = await postLocal({ version: 1, kind: "approval.grant", expectedRevision: mergeState.revision,
     payload: { target: "merge", actionId: verified.actionId, targetRevision: mergeState.actions[verified.actionId!].revision, actor: "user" } });
@@ -1452,4 +1854,153 @@ test("[TASK-024] live route evidence creates a versioned policy, user limits ove
   assert.deepEqual(restored.value.routing?.limits.blockedModels, ["luna-medium"]);
   assert.equal(restored.value.history?.at(-1)?.cause, "rollback");
   assert.equal(resolveRoute(task, routeTask(task), 1, restored.value.routing!, registry, attempts, price).profile.alias, "sol-medium");
+}));
+
+
+test("[IMP-TASK-005] second repository journey keeps review, recovery, merge, and storage boundaries", async () => fixture(async (project, other, home) => {
+  const privateDetail = "Private export design for src/internal.ts";
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", ["-c", `safe.directory=${project.replace(/\\/g, "/")}`, ...args], { cwd: project, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  await writeFile(join(project, ".gitignore"), ".orch/\n");
+  await writeFile(join(project, "README.md"), "Second repository fixture\n");
+  git("add", ".gitignore", "README.md");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Base");
+  const base = git("rev-parse", "main");
+  await writeFile(join(project, "CONTEXT.md"), `${privateDetail}\n`);
+  assert.equal(cli(project, home, "init", "--docs", "CONTEXT.md").status, 0);
+  const service = new CommandService(project);
+  const check = "node -e \"process.exit(require('fs').readFileSync('result.txt','utf8').trim()==='done'?0:1)\"";
+  const task = { id: "TASK-101", description: `Implement ${privateDetail}`, type: "other", difficulty: "easy", risk: "low", dependsOn: [],
+    acceptanceCriteria: ["Output passes validation", "Output has named review"], areas: ["result.txt"], workerProfile: "sol-medium",
+    context: ["CONTEXT.md"], verification: [`command: ${check}`, "review: Inspect result.txt"] };
+  await service.execute({ version: 1, kind: "plan.goal", expectedRevision: await service.revision(), payload: { goal: "Create a reviewed export", questions: [], tasks: [task] } });
+  const blocked = await executionPreflight(project, "live");
+  assert.equal(blocked.directory, project);
+  assert.equal(blocked.git.head, base);
+  assert.equal(blocked.git.dirty, true);
+  assert.deepEqual(blocked.context.unavailable, ["CONTEXT.md"]);
+  assert.ok(blocked.blockers.some((item) => /Plan revision/.test(item)));
+  assert.ok(blocked.blockers.some((item) => /Context unavailable/.test(item)));
+  assert.ok(blocked.blockers.some((item) => /require --check/.test(item)));
+  assert.equal((await api<Record<string, any>>(project, home, "/api/preflight?executor=codex")).context.unavailable[0], "CONTEXT.md");
+  assert.equal(cli(project, home, "draft", "approve").status, 0);
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
+  git("add", "CONTEXT.md");
+  git("-c", "user.name=Orch Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Pin context");
+  const pinned = git("rev-parse", "main");
+  assert.equal(cli(project, home, "worktrees", "base", "main", pinned).status, 0);
+  assert.deepEqual((await executionPreflight(project, "live", check)).context.unavailable, []);
+
+  const bin = join(other, "bin");
+  const entry = join(bin, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const capture = join(other, "capture.json");
+  await mkdir(dirname(entry), { recursive: true });
+  await writeFile(entry, [
+    "const fs = require('node:fs');",
+    "if (!fs.readFileSync('CONTEXT.md','utf8').includes('Private export design')) process.exit(2);",
+    "fs.writeFileSync('result.txt', 'done\\n');",
+    "fs.writeFileSync(process.env.ORCH_CAPTURE, JSON.stringify({cwd:process.cwd(),prompt:process.argv.at(-1)}));",
+    "console.log(JSON.stringify({type:'thread.started',thread_id:'fixture-thread'}));",
+    "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Done'}}));",
+    "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:2}}));",
+  ].join("\n"));
+  await writeFile(join(bin, "codex.cmd"), "rem deterministic Codex launcher\n");
+  await writeFile(join(bin, "codex"), `#!/bin/sh\n"${process.execPath}" "${entry}" "$@"\n`);
+  await chmod(join(bin, "codex"), 0o755);
+  const path = process.platform === "win32" ? [bin, dirname(process.execPath), "C:\\Program Files\\Git\\cmd", "C:\\Windows\\system32"].join(delimiter)
+    : [bin, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter);
+  const live = spawnSync(process.execPath, [join(__dirname, "cli.js"), "run", "--once", "--executor", "codex", "--check", check], {
+    cwd: project, encoding: "utf8", timeout: 60_000, env: { ...process.env, ORCH_HOME: home, ORCH_CAPTURE: capture, PATH: path },
+  });
+  assert.equal(live.status, 0, live.stderr || live.stdout);
+  const manager = await new WorktreeManager(project).load();
+  const worker = (await manager.detail()).workers[task.id];
+  assert.equal(worker.base, pinned);
+  assert.equal(worker.contextId, "fixture-thread");
+  assert.equal(worker.validation?.passed, true);
+  assert.equal(await readFile(join(worker.path, "result.txt"), "utf8"), "done\n");
+  const captured = JSON.parse(await readFile(capture, "utf8")) as { cwd: string; prompt: string };
+  assert.equal(captured.cwd, worker.path);
+  assert.match(captured.prompt, /pinned base/);
+  assert.match(captured.prompt, /Private export design/);
+  assert.equal(git("rev-parse", "main"), pinned);
+  const review = (await checkReport(service, task.id)).rows.find((row) => row.procedure)!;
+  assert.equal(review.status, "unrun");
+  assert.match((await api<{ tasks: Array<{ verification: { reason: string } }> }>(project, home, "/api/tasks")).tasks[0].verification.reason, /review.*unrun/);
+  await assert.rejects(manager.integrate([task.id], check), /review.*unrun/);
+  assert.equal(cli(project, home, "checks", "review", review.id, "--reviewer", "Fixture Reviewer").status, 0);
+  const integration = await manager.integrate([task.id], check);
+  assert.equal(integration.check?.passed, true);
+  assert.ok(integration.actionId);
+  assert.notEqual(integration.commit, pinned);
+  assert.equal(git("rev-parse", "main"), pinned);
+  await assert.rejects(manager.merge(integration.actionId!), /awaits approval/);
+
+  await service.execute({ version: 1, kind: "plan.add", expectedRevision: await service.revision(), payload: { description: "Recover partial output", type: "other", difficulty: "easy", risk: "low" } });
+  await service.execute({ version: 1, kind: "plan.draft", expectedRevision: await service.revision(), payload: { tasks: [task, {
+    id: "TASK-102", description: "Recover partial output", type: "other", difficulty: "easy", risk: "low", dependsOn: [],
+    acceptanceCriteria: ["Inspected partial output can be preserved"], areas: ["partial.txt"], workerProfile: "sol-medium", context: ["CONTEXT.md"],
+    verification: ["command: node -e \"require('fs').accessSync('partial.txt')\""],
+  }] } });
+  assert.equal(cli(project, home, "draft", "approve").status, 0);
+  assert.equal(cli(project, home, "checks", "approve").status, 0);
+  assert.equal(cli(project, home, "worktrees", "base", "main", pinned).status, 0);
+  const graphPath = join(project, ".orch", "tasks.json");
+  const graph = new TaskGraph(JSON.parse(await readFile(graphPath, "utf8")));
+  const recoveryTask = graph.ready().find((item) => item.id !== task.id)!;
+  assert.ok(recoveryTask);
+  const partial = await manager.prepare(recoveryTask);
+  await writeFile(join(partial.path, "partial.txt"), "preserve this\n");
+  await manager.finish(recoveryTask.id, "prior-thread", "prior check", false, "prior failure");
+  graph.markRunning(recoveryTask.id);
+  await writeFile(graphPath, JSON.stringify(graph.snapshot()));
+  await writeFile(join(project, ".orch", "run.lock"), "999999");
+  const interrupted = await api<{ tasks: Array<{ spec: { id: string }; displayStatus: string }> }>(project, home, "/api/tasks");
+  assert.equal(interrupted.tasks.find((item) => item.spec.id === recoveryTask.id)?.displayStatus, "possibly-interrupted");
+  assert.match(cli(project, home, "retry", recoveryTask.id).stderr, /explicit preserve or discard/);
+  assert.equal(cli(project, home, "retry", recoveryTask.id, "--preserve").status, 0);
+  assert.equal(await readFile(join(partial.path, "partial.txt"), "utf8"), "preserve this\n");
+  const recovered = (await (await new WorktreeManager(project).load()).detail()).workers[recoveryTask.id];
+  assert.equal(recovered.reconciliations?.[0].decision, "preserve");
+  assert.equal(recovered.reconciliations?.[0].priorValidation?.output, "prior failure");
+
+  const env = { ORCH_HOME: home, ORCH_NEON_DEVELOPMENT_URL: "postgresql://dev:secret@ep-example.neon.tech/dev" };
+  let queries = 0;
+  const storage = new StorageService(project, env, { query: async () => { queries++; throw new Error(env.ORCH_NEON_DEVELOPMENT_URL); } });
+  const offline = await storage.status("development");
+  assert.equal(offline.lastSuccess, null);
+  assert.equal(offline.pendingLocalChanges, true);
+  assert.equal(queries, 0);
+  const failed = await storage.sync("development");
+  assert.deepEqual(failed.operation, { action: "sync", ok: false });
+  assert.equal(failed.latestFailedAttempt?.error, "Neon connection failed");
+  assert.equal(failed.pendingLocalChanges, true);
+  assert.equal(queries, 1);
+  assert.equal((await storage.status("production")).latestFailedAttempt, null);
+  assert.doesNotMatch(JSON.stringify(failed), /secret|postgresql:\/\/|internal\.ts|Private export design/);
+  const shared = await localSharedSnapshot(project);
+  assert.doesNotMatch(JSON.stringify(shared), /internal\.ts|Private export design|result\.txt|preserve this/);
+  assert.equal(git("rev-parse", "main"), pinned);
+  assert.equal((await readFile(join(project, "README.md"), "utf8")).trim(), "Second repository fixture");
+}));
+
+test("[IMP-TASK-002] metadata replacement retries temporary locks and preserves data on failure", async () => fixture(async (project) => {
+  const source = join(project, "next.json"), destination = join(project, "current.json");
+  await writeFile(source, "new"); await writeFile(destination, "old");
+  const original = fs.rename;
+  let attempts = 0;
+  const lock = mock.method(fs, "rename", async (from: Parameters<typeof fs.rename>[0], to: Parameters<typeof fs.rename>[1]) => {
+    if (from === source && attempts++ < 2) throw Object.assign(new Error("Temporary file lock"), { code: "EPERM" });
+    return original(from, to);
+  });
+  try { await renameWithRetry(source, destination); assert.equal(attempts, 3); assert.equal(await readFile(destination, "utf8"), "new"); }
+  finally { lock.mock.restore(); }
+  await writeFile(source, "pending");
+  const failure = mock.method(fs, "rename", async () => { throw Object.assign(new Error("Disk failure"), { code: "EIO" }); });
+  try { await assert.rejects(renameWithRetry(source, destination), /Disk failure/); assert.equal(failure.mock.calls.length, 1); assert.equal(await readFile(destination, "utf8"), "new"); assert.equal(await readFile(source, "utf8"), "pending"); }
+  finally { failure.mock.restore(); }
 }));

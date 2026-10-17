@@ -3,6 +3,7 @@ import { Executor } from "./executor";
 import { ModelProfile, ModelRegistry, selectModel } from "./models";
 import { ExecutionResult, Route, TaskSpec } from "./types";
 import { access } from "node:fs/promises";
+import { constants } from "node:fs";
 import { delimiter, join } from "node:path";
 
 export class ProviderConfigurationError extends Error {}
@@ -125,8 +126,14 @@ interface CodexLaunch {
 }
 
 export async function resolveCodexLaunch(pathValue = process.env.PATH ?? "", platform = process.platform): Promise<CodexLaunch> {
-  if (platform !== "win32") return { command: "codex", argsPrefix: [] };
   const directories = pathValue.split(delimiter).filter(Boolean);
+  if (platform !== "win32") {
+    for (const directory of directories) {
+      try { await access(join(directory, "codex"), constants.X_OK); return { command: "codex", argsPrefix: [] }; }
+      catch { /* Continue to the next PATH entry. */ }
+    }
+    throw new ProviderConfigurationError("Codex CLI was not found on PATH.");
+  }
   for (const directory of directories) {
     const executable = join(directory, "codex.exe");
     try { await access(executable); return { command: executable, argsPrefix: [] }; }

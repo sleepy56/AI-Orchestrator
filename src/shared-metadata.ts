@@ -103,8 +103,8 @@ export function validateSharedSnapshot(value: unknown): SharedSnapshot {
   return { version: 1, projectId, runs };
 }
 
-export async function localSharedSnapshot(project: string): Promise<SharedSnapshot> {
-  const [view, events] = await Promise.all([new CommandService(project).sharedView() as Promise<{ projectId: string }>, readRunEvents(project)]);
+export async function localSharedSnapshot(project: string, sourceEvents?: RunEvent[], readOnly = false): Promise<SharedSnapshot> {
+  const [view, events] = await Promise.all([new CommandService(project).sharedView(readOnly) as Promise<{ projectId: string }>, sourceEvents ?? readRunEvents(project)]);
   const runs = summarizeRuns(events).map((summary): SharedRun => {
     const runEvents = events.filter((event) => event.runId === summary.runId);
     const start = runEvents.find((event): event is Extract<RunEvent, { type: "run.started" }> => event.type === "run.started");

@@ -22,7 +22,7 @@ export interface RunOptions {
   routeDecision?: (task: TaskSpec, route: Route, attempt: number) => RunEventData;
   initialRoute?: (task: TaskSpec) => Route;
   retryRoute?: (task: TaskSpec, initial: Route, failedAttempts: number) => Route | null;
-  beforeTask?: () => Promise<string | undefined> | string | undefined;
+  beforeTask?: (task: TaskSpec) => Promise<string | undefined> | string | undefined;
   capacity?: (task: TaskSpec, inFlight: TaskSpec[]) => Promise<CapacityDecision>;
 }
 
@@ -44,7 +44,7 @@ export async function orchestrate(
     if (ready.length === 0) break;
     const wave: TaskSpec[] = [];
     for (const task of ready) {
-      paused = await options.beforeTask?.();
+      paused = await options.beforeTask?.(task);
       if (paused) break;
       const decision = await options.capacity?.(task, wave);
       if (decision?.reason) { paused = decision.reason; break; }

@@ -36,6 +36,16 @@ test("run events persist in order and local API exposes read-only project state"
       return { status: response.status, body: await response.json() as Record<string, any> };
     };
     const taskState = await get("/api/tasks");
+    const preflight = await get("/api/preflight");
+    assert.equal(preflight.status, 200);
+    assert.equal(preflight.body.directory, project);
+    assert.equal(preflight.body.mode, "simulated");
+    assert.deepEqual(preflight.body.blockers, []);
+    assert.equal((await get("/api/preflight?executor=wrong")).status, 400);
+    const livePreflight = await get("/api/preflight?executor=codex&check=npm%20test");
+    assert.equal(livePreflight.body.mode, "live");
+    assert.deepEqual(livePreflight.body.verification, ["npm test"]);
+    assert.ok(livePreflight.body.blockers.some((item: string) => item.includes("Git repository")));
     assert.deepEqual(taskState.body.tasks.map((task: { displayStatus: string }) => task.displayStatus), ["completed", "ready"]);
     const models = await get("/api/models");
     assert.equal(models.body.models[0].alias, "luna-low");

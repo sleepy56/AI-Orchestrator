@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { TaskGraph } from "./scheduler";
+import { localRunLiveness } from "./run-events";
 import { defaultRegistry, loadRegistry, ModelProfile, saveRegistry, validateProfile } from "./models";
 import { PriceSnapshot, recommendModelRoute } from "./model-decisions";
 import { KnowledgeStore, AttemptEntry } from "./knowledge";
@@ -25,7 +27,7 @@ export interface Approval { target: "plan" | "checks" | ActionTarget; targetRevi
 export type CheckPhase = "baseline" | "task" | "integration" | "review";
 export type CheckStatus = "pass" | "fail" | "skipped" | "missing";
 export interface CheckValue { taskId?: string; criterion?: string; command?: string; procedure?: string; phase: CheckPhase; cwd: string; timeoutSeconds: number; expected: string; source: "generated" | "user" | "baseline"; planRevision?: number }
-export interface CheckResult { at: string; checkRevision: number; status: CheckStatus; exitCode?: number | null; output?: string; durationMs?: number; reason?: string; reviewer?: string }
+export interface CheckResult { id?: string; at: string; checkRevision: number; status: CheckStatus; exitCode?: number | null; output?: string; durationMs?: number; reason?: string; reviewer?: string }
 export interface CheckRecord extends Versioned<CheckValue> { history: Array<Versioned<CheckValue>>; results: CheckResult[] }
 export interface ProjectRecord { id: string; directory: string; name?: string; git?: { isRepository: boolean; branch?: string; head?: string; dirty?: boolean }; scripts?: Record<string, string>; context?: { version: number; documents: string[] } }
 interface LocalState {
@@ -63,6 +65,24 @@ export function worktreeBaseGate(state: Pick<LocalState, "project" | "plan" | "c
   return undefined;
 }
 
+export async function unavailablePinnedContext(directory: string, commit: string, documents: string[]): Promise<string[]> {
+  const missing: string[] = [];
+  for (const document of documents) {
+    try {
+      const result = await execFileAsync("git", ["-c", `safe.directory=${resolve(directory).replace(/\\/g, "/")}`, "-C", directory,
+        "ls-tree", "-rz", commit, "--", document], { timeout: 5000, windowsHide: true });
+      if (result.stdout.split("\0").some((entry) => /^100(?:644|755) blob [0-9a-f]+\t/.test(entry) && entry.split("\t")[1] === document)) continue;
+    } catch { /* A working-tree file need not exist at the pinned commit. */ }
+    missing.push(document);
+  }
+  return missing;
+}
+
+export async function pinnedContextGate(directory: string, commit: string, documents: string[]): Promise<string | undefined> {
+  const missing = await unavailablePinnedContext(directory, commit, documents);
+  return missing.length ? `Pinned context unavailable at ${commit}: ${missing.join(", ")}` : undefined;
+}
+
 export function actionGate(state: Pick<LocalState, "plan" | "checksRevision" | "approvals" | "actions">, id: string): string | undefined {
   const action = state.actions[id];
   if (!action) throw new Error(`Unknown action: ${id}`);
@@ -70,6 +90,36 @@ export function actionGate(state: Pick<LocalState, "plan" | "checksRevision" | "
   const prerequisite = executionGate(state);
   if (prerequisite) return prerequisite;
   return hasApproval(state, action.value.target, action.revision, id) ? undefined : `${action.value.target} request ${id} revision ${action.revision} awaits approval`;
+}
+
+export function criterionCoverageGate(state: Pick<LocalState, "plan" | "checks">, taskId?: string): string | undefined {
+  for (const task of state.plan.value.draft?.tasks.filter((item) => !taskId || item.id === taskId) ?? []) for (const criterion of task.acceptanceCriteria) {
+    if (!Object.values(state.checks).some((record) => record.value.taskId === task.id && record.value.criterion === criterion &&
+      (record.value.phase === "task" || record.value.phase === "review") &&
+      (record.value.planRevision === undefined || record.value.planRevision === state.plan.revision)))
+      return `${task.id} has no check for acceptance criterion: ${criterion}`;
+  }
+  return undefined;
+}
+
+export function taskVerificationGate(state: Pick<LocalState, "plan" | "checks">, taskId: string,
+  worker?: { commit?: string; validation?: { passed: boolean; checks?: Record<string, string>; at?: string } }): string | undefined {
+  const task = state.plan.value.draft?.tasks.find((item) => item.id === taskId);
+  if (!task) return worker?.commit && worker.validation?.passed ? undefined : `${taskId} has no successful worker output to verify`;
+  const checks = Object.entries(state.checks).filter(([, record]) => record.value.taskId === taskId &&
+    (record.value.phase === "task" || record.value.phase === "review") &&
+    (record.value.planRevision === undefined || record.value.planRevision === state.plan.revision));
+  const coverage = criterionCoverageGate(state, taskId);
+  if (coverage) return coverage;
+  if (!worker?.commit || !worker.validation?.passed) return `${taskId} has no successful worker output to verify`;
+  for (const [id, record] of checks) {
+    const result = [...(record.results ?? [])].reverse().find((item) => item.checkRevision === record.revision);
+    if (result?.status !== "pass") return `${taskId} ${record.value.procedure ? "review" : "check"} ${id} (${record.value.criterion ?? record.value.expected}) is ${result?.status ?? "unrun"}`;
+    if (record.value.command && (!result.id || worker.validation.checks?.[id] !== result.id)) return `${taskId} check ${id} has no current worker-output evidence`;
+    if (record.value.procedure && (!result.reviewer?.trim() || !worker.validation.at || result.at < worker.validation.at))
+      return `${taskId} review ${id} needs a named pass after worker output`;
+  }
+  return undefined;
 }
 
 const types: TaskType[] = ["rename", "refactor", "analysis", "test", "other"];
@@ -233,6 +283,38 @@ export class CommandService {
   private get path(): string { return join(this.directory, ".orch", "commands.v1.json"); }
   private get tasksPath(): string { return join(this.directory, ".orch", "tasks.json"); }
 
+  private async mergeEvidenceGate(state: LocalState, actionId: string): Promise<string | undefined> {
+    if (state.actions[actionId].value.target !== "merge") return undefined;
+    if (!state.plan.value.draft && !Object.values(state.checks).some((record) => record.value.phase === "integration" &&
+      (record.value.planRevision === undefined || record.value.planRevision === state.plan.revision))) return undefined;
+    let worktrees: { workers: Record<string, { commit?: string; validation?: { passed: boolean; checks?: Record<string, string>; at?: string } }>;
+      integrations: Record<string, { actionId?: string; commit?: string; check?: { passed: boolean; checks?: Record<string, string> }; resolvedReviews?: Record<string, string>; taskIds: string[] }> };
+    try { worktrees = JSON.parse(await readFile(join(this.directory, ".orch", "worktrees.json"), "utf8")); }
+    catch (error) { if (!missing(error)) throw error; return "Merge needs a checked integration of verified task output"; }
+    const integration = Object.values(worktrees.integrations).find((item) => item.actionId === actionId);
+    if (!integration?.check?.passed || integration.commit !== state.actions[actionId].value.artifactRevision)
+      return "Merge needs a current checked integration of verified task output";
+    for (const [id, record] of Object.entries(state.checks)) {
+      if (record.value.phase !== "integration" || record.value.taskId && !integration.taskIds.includes(record.value.taskId) ||
+          record.value.planRevision !== undefined && record.value.planRevision !== state.plan.revision) continue;
+      const result = [...(record.results ?? [])].reverse().find((item) => item.checkRevision === record.revision);
+      if (result?.status !== "pass" || !result.id || integration.check.checks?.[id] !== result.id)
+        return `Integration check ${id} is ${result?.status ?? "unrun"} for the current artifact`;
+    }
+    if (state.plan.value.draft) for (const id of integration.taskIds) {
+      const gate = taskVerificationGate(state, id, worktrees.workers[id]);
+      if (gate) return gate;
+      if (integration.resolvedReviews) for (const [checkId, record] of Object.entries(state.checks)) {
+        if (record.value.taskId !== id || record.value.phase !== "review" ||
+            record.value.planRevision !== undefined && record.value.planRevision !== state.plan.revision) continue;
+        const result = [...(record.results ?? [])].reverse().find((item) => item.checkRevision === record.revision);
+        if (result?.status !== "pass" || !result.reviewer?.trim() || result.id === integration.resolvedReviews[checkId])
+          return `${id} review ${checkId} needs a named pass after conflict resolution`;
+      }
+    }
+    return undefined;
+  }
+
   private async verifyMergeBase(action: ActionRequest): Promise<void> {
     if (action.target !== "merge") return;
     let head: string;
@@ -271,6 +353,8 @@ export class CommandService {
     const state = await this.state();
     const gate = actionGate(state, id);
     if (gate) throw new Error(gate);
+    const evidence = await this.mergeEvidenceGate(state, id);
+    if (evidence) throw new Error(evidence);
     await this.verifyMergeBase(state.actions[id].value);
     return { ...state.actions[id].value };
   }
@@ -301,8 +385,11 @@ export class CommandService {
     await this.ensureInitialized();
     return { ...await this.state(), tasks: (await this.tasks()).tasks };
   }
-  async sharedView(): Promise<object> {
-    await this.ensureInitialized();
+  async readOnlyDetail(): Promise<LocalState & { tasks: TaskSnapshot["tasks"] }> {
+    return { ...await this.state(), tasks: (await this.tasks()).tasks };
+  }
+  async sharedView(readOnly = false): Promise<object> {
+    if (!readOnly) await this.ensureInitialized();
     const state = await this.state();
     const projectId = opaqueId(state.project.value.id, "project id");
     // Construct the allowlist explicitly. Never spread local records or command payloads here.
@@ -354,6 +441,8 @@ export class CommandService {
           const actual = (await execFileAsync("git", ["-c", `safe.directory=${this.directory.replace(/\\/g, "/")}`, "-C", this.directory,
             "rev-parse", "--verify", `refs/heads/${branch}`], { timeout: 5000, windowsHide: true })).stdout.trim().toLowerCase();
           if (actual !== commit) throw new Error(`Base branch ${branch} is not at ${commit}`);
+          const contextGate = await pinnedContextGate(this.directory, commit, state.project.value.context?.documents ?? []);
+          if (contextGate) throw new Error(contextGate);
           state.worktreeBase = { branch, commit, planRevision: state.plan.revision, checksRevision: state.checksRevision,
             contextVersion: state.project.value.context?.version ?? 0 };
           subjectId = branch;
@@ -394,6 +483,15 @@ export class CommandService {
           const id = safeId(payload.taskId, "taskId");
           const graph = new TaskGraph(await this.tasks());
           graph.retry(id);
+          const liveness = await localRunLiveness(this.directory);
+          if (liveness !== "stopped") throw new Error(`A run may still be active; inspect the run lock before retrying ${id}`);
+          const { WorktreeManager } = await import("./worktrees.js");
+          const worktrees = await new WorktreeManager(this.directory).load();
+          if ((await worktrees.detail()).workers[id]) {
+            if (payload.reconciliation !== "preserve" && payload.reconciliation !== "discard")
+              throw new Error(`Worker ${id} requires an explicit preserve or discard reconciliation choice`);
+            await worktrees.reconcile(id, payload.reconciliation);
+          } else if (payload.reconciliation !== undefined) throw new Error(`Task ${id} has no worker to reconcile`);
           snapshot = graph.snapshot();
           state.plan.revision++;
           subjectId = id;
@@ -451,8 +549,22 @@ export class CommandService {
           if (record.revision !== payload.checkRevision) throw new Error("Stale check revision");
           const status = choice(payload.status, ["pass", "fail", "skipped", "missing"], "check status");
           if (record.value.command && (status === "pass" || status === "fail") && (!Number.isSafeInteger(payload.durationMs) || payload.exitCode !== null && !Number.isSafeInteger(payload.exitCode))) throw new Error("Executable result needs duration and exit code evidence");
+          if (record.value.command && status === "pass") {
+            const expectedExit = /\bexit\s+(\d+)\b/i.exec(record.value.expected);
+            const expectedOutput = /output includes:\s*(.+)/i.exec(record.value.expected)?.[1]?.trim();
+            if (payload.exitCode !== (expectedExit ? Number(expectedExit[1]) : 0) ||
+                expectedOutput && (typeof payload.output !== "string" || !payload.output.includes(expectedOutput)))
+              throw new Error("Passing executable result does not match expected exit code or output");
+          }
           if (record.value.procedure && status === "pass" && payload.reviewer === undefined) throw new Error("Human review needs a named reviewer");
-          const result: CheckResult = { at: new Date().toISOString(), checkRevision: record.revision, status,
+          if (record.value.procedure && status === "pass" && state.plan.value.draft?.tasks.some((task) => task.id === record.value.taskId)) {
+            let workers: Record<string, { commit?: string; validation?: { passed: boolean } }> = {};
+            try { workers = (JSON.parse(await readFile(join(this.directory, ".orch", "worktrees.json"), "utf8")) as { workers: typeof workers }).workers; }
+            catch (error) { if (!missing(error)) throw error; }
+            const worker = workers[record.value.taskId!];
+            if (!worker?.commit || !worker.validation?.passed) throw new Error("Human review waits for successful worker output");
+          }
+          const result: CheckResult = { id: randomUUID(), at: new Date().toISOString(), checkRevision: record.revision, status,
             ...(payload.exitCode === undefined ? {} : { exitCode: payload.exitCode as number | null }),
             ...(payload.output === undefined ? {} : { output: string(payload.output, "output").slice(-8192) }),
             ...(payload.durationMs === undefined ? {} : { durationMs: validRevision(payload.durationMs, "durationMs") }),
@@ -490,6 +602,10 @@ export class CommandService {
           if (target === "plan" && targetRevision !== state.plan.revision) throw new Error("Stale plan approval");
           if (target === "plan" && state.plan.value.draft?.status === "clarifying") throw new Error("Answer planning questions before approval");
           if (target === "checks" && targetRevision !== state.checksRevision) throw new Error("Stale checks approval");
+          if (target === "checks") {
+            const coverage = criterionCoverageGate(state);
+            if (coverage) throw new Error(`Cannot approve checks: ${coverage}`);
+          }
           const actionId = target === "merge" || target === "deployment" ? opaqueId(payload.actionId, "action id") : undefined;
           if (actionId) {
             const action = state.actions[actionId];
@@ -497,6 +613,8 @@ export class CommandService {
             if (action.value.planRevision !== state.plan.revision || action.value.checksRevision !== state.checksRevision) throw new Error("Action request needs revision after plan or checks changed");
             const prerequisite = executionGate(state);
             if (prerequisite) throw new Error(prerequisite);
+            const evidence = await this.mergeEvidenceGate(state, actionId);
+            if (evidence) throw new Error(evidence);
             await this.verifyMergeBase(action.value);
           } else if (payload.actionId !== undefined) throw new Error("Plan and checks approvals cannot name an action");
           if (payload.actor !== "user") throw new Error("Only user approval is accepted");
@@ -533,6 +651,10 @@ export class CommandService {
           if (status === "paused" && previous && previous.value.status !== "running") throw new Error("Run is not running");
           if (status === "running" && previous && previous.value.status !== "paused") throw new Error("Run is not paused");
           if (status === "running" && runGate) throw new Error(runGate);
+          if (status === "running" && mode === "live") {
+            const contextGate = await pinnedContextGate(this.directory, state.worktreeBase!.commit, state.project.value.context?.documents ?? []);
+            if (contextGate) throw new Error(contextGate);
+          }
           const pauseReason = status === "paused" ? (runGate ?? (payload.reason === undefined ? undefined : string(payload.reason, "pause reason"))) : undefined;
           if (status === "paused" && !pauseReason) throw new Error("A pause reason is required");
           if ((status === "finished" || status === "failed") && previous?.value.status !== "running") throw new Error("Run is not running");
@@ -660,6 +782,6 @@ async function atomicWrite(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path);
   } finally { await rm(temporary, { force: true }); }
 }

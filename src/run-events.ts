@@ -71,6 +71,23 @@ export async function readRunEvents(project: string): Promise<RunEvent[]> {
   });
 }
 
+export async function localRunLiveness(project: string, activeJob = false): Promise<"active" | "stopped" | "unknown"> {
+  if (activeJob) return "active";
+  let value: string;
+  try { value = (await readFile(join(project, ".orch", "run.lock"), "utf8")).trim(); }
+  catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return "stopped";
+    throw error;
+  }
+  const pid = Number(value);
+  if (!Number.isSafeInteger(pid) || pid < 1) return "unknown";
+  try { process.kill(pid, 0); return "active"; }
+  catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") return "stopped";
+    return "unknown";
+  }
+}
+
 export interface RunSummary {
   runId: string;
   mode: RunMode;

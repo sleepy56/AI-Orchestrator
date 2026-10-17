@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { appendFile, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FakeExecutor } from "./executor";
 import { KnowledgeScope, KnowledgeStore, SelectedLesson } from "./knowledge";
 import { createLocalApi } from "./local-api";
-import { actionGate, Command, CommandService, executionGate, worktreeBaseGate } from "./command-service";
+import { actionGate, Command, CommandService, executionGate, taskVerificationGate, worktreeBaseGate } from "./command-service";
 import { checkReport, runBaseline, runCheck } from "./checks";
 import { PlanningWorkflow } from "./planning";
 import { PriceSnapshot, recommendModelRoute } from "./model-decisions";
@@ -20,8 +21,10 @@ import { Difficulty, Risk, Route, TaskSnapshot, TaskSpec, TaskType } from "./typ
 import { WorktreeCodexExecutor, WorktreeManager } from "./worktrees";
 import { CapacityScheduler, capacityAvailability, readCapacity } from "./capacity";
 import { PostgresMetadata } from "./postgres-metadata";
-import { NeonMetadata, neonConfig, localSharedLessons, NeonEnvironment } from "./neon-metadata";
+import { NeonMetadata, neonConfig, NeonEnvironment } from "./neon-metadata";
 import { localSharedSnapshot } from "./shared-metadata";
+import { neonEnvironmentFile, StorageService } from "./storage";
+import { executionPreflight } from "./preflight";
 import { constrainProposal, resolveRoute } from "./routing-policy";
 import { nextRoute } from "./escalation";
 
@@ -45,16 +48,17 @@ function usage(): string {
     "  orch draft answer --file answers.json [--project directory]",
     "  orch draft edit --file tasks.json [--project directory]",
     "  orch draft approve [--project directory]",
-    "  orch checks approve [--project directory]",
+    "  orch checks approve [--project directory]  (requires a task or review check for every draft criterion)",
     "  orch checks baseline|list [TASK-001] [--project directory]",
     "  orch checks history <check-id> [--project directory]",
     "  orch checks add TASK-001 --command 'npm test' --phase task --timeout-seconds 600 --expected 'exit 0' [--cwd .] [--criterion text] [--project directory]",
     "  orch checks run <check-id>|task TASK-001 [--project directory]",
     "  orch checks skip <check-id> --reason text [--project directory]",
-    "  orch checks review <check-id> --reviewer name [--project directory]",
+    "  orch checks review <check-id> --reviewer name [--project directory]  (after worker output)",
     "  orch status [--project directory]",
+    "  orch preflight [--project directory] [--executor fake|codex] [--check 'npm test']",
     "  orch capacity [--project directory]  (show measured or unknown provider capacity)",
-    "  orch retry TASK-001 [--project directory]  (after a failed or stopped run)",
+    "  orch retry TASK-001 [--preserve|--discard] [--project directory]  (after the prior run stops)",
     "  orch run [--once] [--resume RUN-ID] [--project directory] [--executor fake|codex] [--check 'npm test'] [--timeout-seconds 600]",
     "  orch worktrees base <branch> <commit> [--project directory]",
     "  orch worktrees show [--project directory]",
@@ -81,7 +85,7 @@ function usage(): string {
     "  orch serve [--project directory] [--port 8765]  (local API)",
     "  orch command --json '{...}' [--project directory]  (versioned local command)",
     "  orch shared migrate|sync|runs [--project directory]  (Docker Postgres)",
-    "  orch shared neon migrate|sync|runs --environment development|production [--project directory]  (optional Neon)",
+    "  orch shared neon status|diagnose|sync|runs|migrate --environment development|production [--env-file path] [--project directory]",
     "  orch skill install [--to skills-directory] [--force]",
     "  orch help",
     "",
@@ -101,7 +105,8 @@ function parseArguments(args: string[], allowed: string[]): { positionals: strin
     }
     const name = token.slice(2);
     if (!allowed.includes(name)) throw new Error(`Unknown option: ${token}`);
-    if (name === "force" || name === "enable" || name === "once") {
+    if (name === "force" || name === "enable" || name === "once" || name === "preserve" || name === "discard") {
+      if (options[name] !== undefined) throw new Error(`Option ${token} was provided twice`);
       options[name] = true;
       continue;
     }
@@ -152,7 +157,7 @@ async function saveSnapshot(project: string, snapshot: TaskSnapshot): Promise<vo
   const temporary = `${target}.${process.pid}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-    await rename(temporary, target);
+    await renameWithRetry(temporary, target);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -215,6 +220,7 @@ async function draft(args: string[]): Promise<void> {
   const service = new CommandService(project);
   if (action === "start") {
     if (!positionals.length || option(options, "file")) throw new Error("draft start needs a goal");
+    console.error("Drafting plan with Codex. This may take a few minutes; no workers are running.");
     await new PlanningWorkflow(project).start(positionals.join(" "));
   } else if (action === "answer") {
     if (positionals.length || !option(options, "file")) throw new Error("draft answer needs --file answers.json");
@@ -329,8 +335,11 @@ async function actions(args: string[]): Promise<void> {
     await service.requireActionApproval(id);
   } else if (operation !== "show") throw new Error("Use orch actions request|show|approve|ready");
   const updated = await service.detail();
+  let gate = actionGate(updated, id);
+  if (!gate) try { await service.requireActionApproval(id); }
+  catch (error) { gate = error instanceof Error ? error.message : String(error); }
   console.log(JSON.stringify({ id, revision: updated.actions[id].revision, ...updated.actions[id].value,
-    gate: actionGate(updated, id) ?? null }, null, 2));
+    gate: gate ?? null }, null, 2));
 }
 
 async function worktrees(args: string[]): Promise<void> {
@@ -374,12 +383,19 @@ async function status(args: string[]): Promise<void> {
   if (positionals.length) throw new Error("status does not accept positional arguments");
   const graph = await loadGraph(resolve(option(options, "project") ?? process.cwd()));
   const records = graph.snapshot().tasks;
+  const project = resolve(option(options, "project") ?? process.cwd());
+  const detail = await new CommandService(project).detail();
+  const workers = detail.plan.value.draft ? (await (await new WorktreeManager(project).load()).detail()).workers : {};
   if (!records.length) {
     console.log("No tasks planned. Use orch plan to add one.");
     return;
   }
   for (const record of records) {
     console.log(`${record.spec.id}  ${graph.status(record.spec.id)}  ${record.spec.description}  (${record.attempts.length} attempts)`);
+    if (record.status === "completed" && detail.plan.value.draft) {
+      const gate = taskVerificationGate(detail, record.spec.id, workers[record.spec.id]);
+      console.log(gate ? `  Worker output complete; verification pending: ${gate}` : "  Criterion checks and named reviews passed; integration pending");
+    }
     if (record.status === "failed" && record.failureReason) console.log(`  Reason: ${record.failureReason}`);
   }
   const signal = await readCapacity(resolve(option(options, "project") ?? process.cwd()));
@@ -394,12 +410,14 @@ async function capacity(args: string[]): Promise<void> {
 }
 
 async function retry(args: string[]): Promise<void> {
-  const { positionals, options } = parseArguments(args, ["project"]);
+  const { positionals, options } = parseArguments(args, ["project", "preserve", "discard"]);
   if (positionals.length !== 1) throw new Error("retry needs one task ID");
+  if (options.preserve && options.discard) throw new Error("Choose either --preserve or --discard");
   const project = resolve(option(options, "project") ?? process.cwd());
   const service = new CommandService(project);
-  await service.execute({ version: 1, kind: "plan.retry", expectedRevision: await service.revision(), payload: { taskId: positionals[0] } });
-  console.log(`${positionals[0]} reset to pending. Inspect any prior changes before running it again.`);
+  await service.execute({ version: 1, kind: "plan.retry", expectedRevision: await service.revision(),
+    payload: { taskId: positionals[0], ...(options.preserve ? { reconciliation: "preserve" } : options.discard ? { reconciliation: "discard" } : {}) } });
+  console.log(`${positionals[0]} reset to pending.`);
 }
 
 async function run(args: string[]): Promise<number> {
@@ -465,6 +483,8 @@ async function runUnlocked(args: string[]): Promise<number> {
   if (mode === "codex") {
     const baseGate = worktreeBaseGate(planning);
     if (baseGate) throw new Error(baseGate);
+    const preflight = await executionPreflight(project, "live", option(options, "check"));
+    if (preflight.blockers.length) throw new Error(preflight.blockers.join("; "));
   }
   const knowledge = new KnowledgeStore(project);
   const registry = await loadRegistry(project);
@@ -488,7 +508,7 @@ async function runUnlocked(args: string[]): Promise<number> {
       if (worker?.validation?.passed) throw new Error(`Task ${record.spec.id} has validated worktree output; inspect and reconcile it before retry`);
       if (worker && !(await stat(worker.path).then((item) => item.isDirectory(), () => false)))
         throw new Error(`Task ${record.spec.id} worktree is missing; inspect before retry`);
-      if (worker) throw new Error(`Task ${record.spec.id} has interrupted worktree output at ${worker.path}. Ensure its worker has stopped and inspect changes, then use orch retry ${record.spec.id}, repin the approved worktree base, and resume this run`);
+      if (worker) throw new Error(`Task ${record.spec.id} has interrupted worktree output at ${worker.path}. Inspect changes, then use orch retry ${record.spec.id} --preserve or --discard after its worker stops`);
     }
     for (const record of unfinished) {
       graph.retry(record.spec.id);
@@ -535,10 +555,20 @@ async function runUnlocked(args: string[]): Promise<number> {
   }, {
     maxTasks: options.once === true ? 1 : undefined,
     capacity: scheduler ? (task, inFlight) => scheduler.decide(task, inFlight) : undefined,
-    beforeTask: async () => {
+    beforeTask: async (task) => {
       const current = await commands.detail();
       if (mode === "codex" && current.policy.revision !== planning.policy.revision) return "Routing policy changed; resume with the current version";
-      return mode === "codex" ? worktreeBaseGate(current) : executionGate(current);
+      if (mode !== "codex") return executionGate(current);
+      const gate = worktreeBaseGate(current);
+      if (gate) return gate;
+      if (current.plan.value.draft && task.dependsOn.length) {
+        const workers = (await (await new WorktreeManager(project).load()).detail()).workers;
+        for (const id of task.dependsOn) {
+          const pending = taskVerificationGate(current, id, workers[id]);
+          if (pending) return `Dependency verification pending: ${pending}. Record review and resume this run`;
+        }
+      }
+      return undefined;
     },
     initialRoute: mode === "codex" ? (task) => resolved(task, routeTask(task), 1).route : undefined,
     retryRoute: mode === "codex" ? (task, initial, failed) => {
@@ -595,6 +625,12 @@ async function runUnlocked(args: string[]): Promise<number> {
   }
   for (const record of result.snapshot.tasks) {
     console.log(`${record.spec.id}: ${record.status}`);
+    if (record.status === "completed" && mode === "codex" && planning.plan.value.draft) {
+      const state = await commands.detail();
+      const worker = (await (await new WorktreeManager(project).load()).detail()).workers[record.spec.id];
+      const gate = taskVerificationGate(state, record.spec.id, worker);
+      console.log(gate ? `  Worker output complete; verification pending: ${gate}` : "  Criterion checks and named reviews passed; integration pending");
+    }
     if (record.status === "failed" && record.failureReason) console.log(`  Reason: ${record.failureReason}`);
   }
   if (result.blocked.length) console.log(`Blocked: ${result.blocked.join(", ")}`);
@@ -797,21 +833,23 @@ async function shared(args: string[]): Promise<void> {
   const [action, ...rest] = args;
   if (action === "neon") {
     const [operation, ...cloudArgs] = rest;
-    const { positionals, options } = parseArguments(cloudArgs, ["project", "environment"]);
-    if (positionals.length || !["migrate", "sync", "runs"].includes(operation) ||
+    const { positionals, options } = parseArguments(cloudArgs, ["project", "environment", "env-file"]);
+    if (positionals.length || !["migrate", "sync", "runs", "status", "diagnose"].includes(operation) ||
         !["development", "production"].includes(option(options, "environment") ?? ""))
-      throw new Error("Use shared neon migrate|sync|runs --environment development|production [--project directory]");
+      throw new Error("Use shared neon status|diagnose|sync|runs|migrate --environment development|production [--env-file path] [--project directory]");
     const environment = option(options, "environment") as NeonEnvironment;
-    const database = new NeonMetadata(neonConfig(environment));
-    if (operation === "migrate") { await database.migrate(); console.log(`Neon ${environment} schema migrated`); return; }
+    const env = option(options, "env-file") ? await neonEnvironmentFile(option(options, "env-file")!) : process.env;
     const project = resolve(option(options, "project") ?? process.cwd());
+    const storage = new StorageService(project, env);
+    if (operation === "status" || operation === "diagnose" || operation === "sync") {
+      console.log(JSON.stringify(await (operation === "status" ? storage.status(environment) : operation === "diagnose"
+        ? storage.diagnose(environment) : storage.sync(environment))));
+      return;
+    }
+    const database = new NeonMetadata(neonConfig(environment, env));
+    if (operation === "migrate") { await database.migrate(); console.log(`Neon ${environment} schema migrated`); return; }
     const snapshot = await localSharedSnapshot(project);
-    if (operation === "sync") {
-      const lessons = await localSharedLessons(project);
-      await database.migrate();
-      await database.sync(snapshot, lessons);
-      console.log(`Synced ${snapshot.runs.length} runs and ${lessons.length} reviewed global lessons to Neon ${environment}`);
-    } else console.log(JSON.stringify(await database.runs(snapshot.projectId)));
+    console.log(JSON.stringify(await database.runs(snapshot.projectId)));
     return;
   }
   const { positionals, options } = parseArguments(rest, ["project"]);
@@ -869,6 +907,14 @@ async function main(args: string[]): Promise<number> {
     case "status":
       await status(rest);
       return 0;
+    case "preflight": {
+      const { positionals, options } = parseArguments(rest, ["project", "executor", "check"]);
+      if (positionals.length) throw new Error("preflight does not accept positional arguments");
+      const mode = oneOf(option(options, "executor"), ["fake", "codex"] as const, "fake", "executor");
+      console.log(JSON.stringify(await executionPreflight(resolve(option(options, "project") ?? process.cwd()),
+        mode === "codex" ? "live" : "simulated", option(options, "check")), null, 2));
+      return 0;
+    }
     case "capacity":
       await capacity(rest);
       return 0;

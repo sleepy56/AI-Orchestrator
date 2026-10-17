@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { cp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { CommandService, worktreeBaseGate } from "./command-service";
+import { CommandService, taskVerificationGate, worktreeBaseGate } from "./command-service";
+import { localRunLiveness } from "./run-events";
 import { TaskSpec } from "./types";
 import { Executor } from "./executor";
 import { CodexExecutor } from "./providers";
@@ -12,8 +14,8 @@ import { ExecutionResult, Route } from "./types";
 import { runCheck } from "./checks";
 
 const exec = promisify(execFile);
-interface WorkerRecord { taskId: string; branch: string; path: string; approvedBase: string; targetBranch: string; base: string; dependencies: Record<string, string>; integrationIds?: string[]; contextDocuments: string[]; lessonIds: string[]; contextId?: string; commit?: string; validation?: { passed: boolean; command: string; output: string } }
-interface IntegrationRecord { id: string; branch: string; path: string; target: string; base: string; taskIds: string[]; conflicts: string[]; diff: string; commit?: string; check?: { command: string; passed: boolean; output: string }; actionId?: string; merged?: boolean }
+interface WorkerRecord { taskId: string; branch: string; path: string; approvedBase: string; targetBranch: string; base: string; dependencies: Record<string, string>; integrationIds?: string[]; contextDocuments: string[]; lessonIds: string[]; contextId?: string; commit?: string; validation?: { passed: boolean; command: string; output: string; at?: string; checks?: Record<string, string> }; reconciliations?: Array<{ at: string; decision: "preserve" | "discard"; applied: boolean; priorBase: string; priorHead: string; priorDiffId: string; priorCommit?: string; priorContextId?: string; priorValidation?: WorkerRecord["validation"] }>; verification?: { passed: boolean; reason?: string } }
+interface IntegrationRecord { id: string; branch: string; path: string; target: string; base: string; taskIds: string[]; conflicts: string[]; diff: string; commit?: string; check?: { command: string; passed: boolean; output: string; checks?: Record<string, string> }; resolvedReviews?: Record<string, string>; actionId?: string; merged?: boolean }
 interface WorktreeState { workers: Record<string, WorkerRecord>; integrations: Record<string, IntegrationRecord> }
 
 export class WorktreeManager {
@@ -35,11 +37,53 @@ export class WorktreeManager {
     catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error; }
     return this;
   }
+  async reconcile(taskId: string, decision: "preserve" | "discard"): Promise<void> {
+    if (decision !== "preserve" && decision !== "discard") throw new Error("Choose preserve or discard");
+    const worker = this.state.workers[taskId];
+    if (!worker) return;
+    if (await localRunLiveness(this.project) !== "stopped") throw new Error(`A run may still be active; inspect the run lock before reconciling ${taskId}`);
+    const area = resolve(this.project, ".orch", "worktrees");
+    const suffix = /^[A-Za-z0-9_-]+$/.test(taskId) && worker.branch.match(new RegExp(`^orch/task-${taskId}-([0-9a-f-]{36})$`))?.[1];
+    if (!suffix || worker.taskId !== taskId || resolve(worker.path) !== join(area, `task-${taskId}-${suffix}`) ||
+      await realpath(worker.path) !== resolve(worker.path) ||
+      resolve(await this.git(worker.path, "rev-parse", "--show-toplevel")) !== resolve(worker.path) ||
+      await this.git(worker.path, "symbolic-ref", "--short", "HEAD") !== worker.branch ||
+      !/^[0-9a-f]{40}$/.test(worker.base)) throw new Error(`Worker ${taskId} is not its recorded worktree`);
+    const diff = createHash("sha256");
+    diff.update(worker.base);
+    const head = await this.git(worker.path, "rev-parse", "HEAD");
+    diff.update(head);
+    diff.update(await this.git(worker.path, "diff", "--binary", "HEAD", "--"));
+    diff.update(await this.git(worker.path, "diff", "--binary", "--cached", "HEAD", "--"));
+    const untracked = (await this.git(worker.path, "ls-files", "--others", "-z")).split("\0")
+      .filter((path) => path && !path.startsWith(".orch/")).sort();
+    for (const path of untracked) {
+      diff.update(path).update("\0");
+      diff.update(await this.git(worker.path, "hash-object", "--no-filters", "--", path)).update("\0");
+    }
+    const entry = { at: new Date().toISOString(), decision, applied: false, priorBase: worker.base, priorHead: head, priorDiffId: diff.digest("hex"),
+      ...(worker.commit ? { priorCommit: worker.commit } : {}), ...(worker.contextId ? { priorContextId: worker.contextId } : {}),
+      ...(worker.validation ? { priorValidation: worker.validation } : {}) };
+    if (await localRunLiveness(this.project) !== "stopped") throw new Error(`A run became active before reconciling ${taskId}`);
+    worker.reconciliations ??= [];
+    worker.reconciliations.push(entry);
+    await this.save();
+    if (decision === "discard") {
+      if (await localRunLiveness(this.project) !== "stopped") throw new Error(`A run became active before discarding ${taskId}`);
+      await this.git(worker.path, "reset", "--hard", worker.base);
+      await this.git(worker.path, "clean", "-fdx", "-e", ".orch/", "--");
+    }
+    delete worker.commit;
+    delete worker.contextId;
+    delete worker.validation;
+    entry.applied = true;
+    await this.save();
+  }
   private async save(): Promise<void> {
     const write = async () => {
       await mkdir(join(this.project, ".orch"), { recursive: true });
       const temporary = `${this.statePath}.${randomUUID()}.tmp`;
-      try { await writeFile(temporary, `${JSON.stringify(this.state, null, 2)}\n`, { flag: "wx" }); await rename(temporary, this.statePath); }
+      try { await writeFile(temporary, `${JSON.stringify(this.state, null, 2)}\n`, { flag: "wx" }); await renameWithRetry(temporary, this.statePath); }
       finally { await rm(temporary, { force: true }); }
     };
     this.pending = this.pending.then(write, write);
@@ -52,6 +96,31 @@ export class WorktreeManager {
     const base = state.worktreeBase!;
     if (await this.git(this.project, "rev-parse", `refs/heads/${base.branch}`) !== base.commit) throw new Error("Approved base branch has moved");
     return base;
+  }
+  private async requireTaskVerification(taskId: string): Promise<void> {
+    const reason = taskVerificationGate(await this.service.detail(), taskId, this.state.workers[taskId]);
+    if (reason) throw new Error(reason);
+  }
+  private async runIntegrationChecks(integration: IntegrationRecord): Promise<void> {
+    if (!integration.check) return;
+    const state = await this.service.detail();
+    const checks = Object.entries(state.checks).filter(([, record]) => record.value.phase === "integration" &&
+      (!record.value.taskId || integration.taskIds.includes(record.value.taskId)) &&
+      (record.value.planRevision === undefined || record.value.planRevision === state.plan.revision));
+    integration.check.checks = {};
+    for (const [id] of checks) {
+      const result = await runCheck(this.service, id, integration.path);
+      integration.check.checks[id] = result.id!;
+      if (result.status !== "pass") {
+        integration.check.passed = false;
+        integration.check.output = `${integration.check.output}\nIntegration check ${id}: ${result.status}${result.reason ? ` (${result.reason})` : ""}`.trim();
+      }
+    }
+    const changed = await this.git(integration.path, "status", "--porcelain", "--untracked-files=no");
+    if (changed) {
+      integration.check.passed = false;
+      integration.check.output = `${integration.check.output}\nIntegration checks changed tracked files: ${changed}`.trim();
+    }
   }
   async prepare(task: TaskSpec, lessonIds: string[] = []): Promise<WorkerRecord> {
     if (!/^[A-Za-z0-9_-]+$/.test(task.id)) throw new Error("Invalid task ID for a worktree");
@@ -67,6 +136,7 @@ export class WorktreeManager {
       const worker = this.state.workers[id];
       if (!worker?.validation?.passed || !worker.commit) throw new Error(`Dependency ${id} has no validated commit`);
       if (worker.approvedBase !== approved.commit || worker.targetBranch !== approved.branch) throw new Error(`Dependency ${id} belongs to a different approved base`);
+      await this.requireTaskVerification(id);
       dependencies[id] = worker.commit;
     }
     const covered = new Set<string>();
@@ -132,22 +202,31 @@ export class WorktreeManager {
     record.lessonIds = [...lessonIds];
     await this.save();
   }
-  async finish(taskId: string, contextId: string | undefined, command: string, passed: boolean, output: string): Promise<WorkerRecord> {
+  async finish(taskId: string, contextId: string | undefined, command: string, passed: boolean, output: string,
+    checks: Record<string, string> = {}): Promise<WorkerRecord> {
     const record = this.state.workers[taskId];
     if (!record) throw new Error(`No worktree for ${taskId}`);
     record.contextId = contextId;
-    record.validation = { command, passed, output: output.slice(-8192) };
     if (passed) {
-      await this.git(record.path, "add", "-A", "--", ".", ":(exclude).orch");
+      await this.git(record.path, "add", "-A", "--", ".", ":(exclude,glob)**/.orch/**");
       if (await this.git(record.path, "status", "--porcelain", "--untracked-files=no")) {
         await this.git(record.path, "-c", "user.name=Orch", "-c", "user.email=orch@localhost", "commit", "-m", `Complete ${taskId}`);
       }
       record.commit = await this.git(record.path, "rev-parse", "HEAD");
     }
+    record.validation = { command, passed, output: output.slice(-8192), at: new Date().toISOString(), checks };
     await this.save();
     return record;
   }
-  async detail(): Promise<WorktreeState> { return JSON.parse(JSON.stringify(this.state)) as WorktreeState; }
+  async detail(): Promise<WorktreeState> {
+    const copy = JSON.parse(JSON.stringify(this.state)) as WorktreeState;
+    const state = await this.service.readOnlyDetail();
+    for (const [id, worker] of Object.entries(copy.workers)) {
+      const reason = taskVerificationGate(state, id, worker);
+      worker.verification = { passed: !reason, ...(reason ? { reason } : {}) };
+    }
+    return copy;
+  }
   async integrate(taskIds: string[], checkCommand: string): Promise<IntegrationRecord> {
     if (!taskIds.length || new Set(taskIds).size !== taskIds.length) throw new Error("Integration needs unique task IDs");
     if (!checkCommand.trim()) throw new Error("Integration needs a validation command");
@@ -158,6 +237,7 @@ export class WorktreeManager {
       if (record.approvedBase !== approved.commit || record.targetBranch !== approved.branch) throw new Error(`Task ${id} was built from a different approved base`);
       return record;
     });
+    for (const id of taskIds) await this.requireTaskVerification(id);
     const id = randomUUID();
     const branch = `orch/integration-${id}`;
     const path = join(this.project, ".orch", "worktrees", `integration-${id}`);
@@ -187,6 +267,7 @@ export class WorktreeManager {
     const changedByCheck = await this.git(path, "status", "--porcelain", "--untracked-files=no");
     integration.check = { command: checkCommand, passed: check.passed && !changedByCheck,
       output: changedByCheck ? `${check.output}\nIntegration check changed tracked files: ${changedByCheck}`.trim() : check.output };
+    await this.runIntegrationChecks(integration);
     await this.save();
     if (integration.check.passed) {
       const action = await this.service.execute({ version: 1, kind: "action.request", expectedRevision: await this.service.revision(),
@@ -206,9 +287,11 @@ export class WorktreeManager {
     if (await this.git(integration.path, "diff", "--name-only", "--diff-filter=U")) throw new Error("Resolve all integration conflicts before verification");
     if (await this.git(integration.path, "status", "--porcelain", "--untracked-files=no")) throw new Error("Commit the resolved integration before verification");
     const head = await this.git(integration.path, "rev-parse", "HEAD");
+    const artifactChanged = integration.commit !== head;
     for (const taskId of integration.taskIds) {
       const worker = this.state.workers[taskId];
       if (!worker?.validation?.passed || !worker.commit || worker.approvedBase !== approved.commit) throw new Error(`Task ${taskId} has no validated commit for this base`);
+      await this.requireTaskVerification(taskId);
       try { await this.git(integration.path, "merge-base", "--is-ancestor", worker.commit, head); }
       catch { throw new Error(`Resolved integration does not include ${taskId}`); }
     }
@@ -222,11 +305,19 @@ export class WorktreeManager {
     const changed = await this.git(integration.path, "status", "--porcelain", "--untracked-files=no");
     integration.check = { command: checkCommand, passed: check.passed && !changed,
       output: changed ? `${check.output}\nIntegration check changed tracked files: ${changed}`.trim() : check.output };
+    await this.runIntegrationChecks(integration);
     if (integration.check.passed) {
+      if (integration.conflicts.length || artifactChanged) {
+        const state = await this.service.detail();
+        integration.resolvedReviews = Object.fromEntries(Object.entries(state.checks).filter(([, record]) =>
+          record.value.phase === "review" && integration.taskIds.includes(record.value.taskId ?? "") &&
+          (record.value.planRevision === undefined || record.value.planRevision === state.plan.revision)).map(([id, record]) =>
+          [id, [...(record.results ?? [])].reverse().find((item) => item.checkRevision === record.revision)?.id ?? ""]));
+      }
       integration.conflicts = [];
       integration.commit = head;
       integration.diff = await this.git(integration.path, "diff", `${approved.commit}..HEAD`, "--");
-      if (!integration.actionId) {
+      if (!integration.actionId || artifactChanged) {
         const action = await this.service.execute({ version: 1, kind: "action.request", expectedRevision: await this.service.revision(),
           payload: { target: "merge", destination: approved.branch, artifactRevision: head, baseRevision: approved.commit } });
         integration.actionId = action.subjectId;
@@ -279,13 +370,15 @@ export class WorktreeCodexExecutor implements Executor {
     const checkIds = Object.entries(state.checks).filter(([, check]) => check.value.taskId === task.id && check.value.phase === "task" &&
       check.value.command && (check.value.planRevision === undefined || check.value.planRevision === state.plan.revision)).map(([id]) => id);
     const failures: string[] = [];
+    const evidence: Record<string, string> = {};
     if (result.succeeded) for (const id of checkIds) {
       const check = await runCheck(service, id, record.path);
+      evidence[id] = check.id!;
       if (check.status !== "pass") failures.push(`${id}: ${check.status}${check.reason ? ` (${check.reason})` : ""}`);
     }
     const passed = result.succeeded && failures.length === 0;
     const error = failures.length ? `Approved task checks failed: ${failures.join("; ")}` : result.error;
-    const finished = await this.manager.finish(task.id, result.contextId, this.checkCommand, passed, error ?? result.checkOutput ?? "Validation passed");
+    const finished = await this.manager.finish(task.id, result.contextId, this.checkCommand, passed, error ?? result.checkOutput ?? "Validation passed", evidence);
     return { ...result, succeeded: passed, ...(error ? { error } : {}), worktree: record.path,
       ...(finished.commit ? { commit: finished.commit } : {}) };
   }

@@ -17,10 +17,11 @@ export interface NeonConfig {
 export interface NeonTransport { query(sql: string, config: NeonConfig): Promise<string> }
 
 export function neonConfig(environment: NeonEnvironment, env: NodeJS.ProcessEnv = process.env): NeonConfig {
+  if (environment !== "development" && environment !== "production") throw new Error("Invalid Neon environment");
   const setting = environment === "development" ? "ORCH_NEON_DEVELOPMENT_URL" : "ORCH_NEON_PRODUCTION_URL";
   const otherSetting = environment === "development" ? "ORCH_NEON_PRODUCTION_URL" : "ORCH_NEON_DEVELOPMENT_URL";
-  const raw = env[setting];
-  if (!raw) throw new Error(`${setting} is required for Neon sync`);
+  const raw = env[setting] ?? (env.DATABASE_URL && env.NEON_BRANCH === environment ? env.DATABASE_URL : undefined);
+  if (!raw) throw new Error(env.DATABASE_URL ? `DATABASE_URL requires matching NEON_BRANCH=${environment}` : `${setting} is required for Neon ${environment}`);
   let url: URL;
   try { url = new URL(raw); }
   catch { throw new Error(`Invalid ${setting}`); }
@@ -93,6 +94,16 @@ function literal(value: string): string { return `'${value.replace(/'/g, "''")}'
 export class NeonMetadata extends PostgresMetadata {
   constructor(readonly config: NeonConfig, private readonly transport: NeonTransport = psqlNeonTransport) { super(); }
   protected query(sql: string): Promise<string> { return this.transport.query(sql, this.config); }
+  async diagnose(): Promise<Record<string, { present: boolean; count: number | null }>> {
+    const tables = ["schema_migrations", "shared_projects", "shared_runs", "shared_run_tasks", "shared_attempts", "shared_global_lessons"];
+    const presence = JSON.parse(await this.query(`SELECT json_build_object(${tables.map((table) => `'${table}', to_regclass('public.${table}') IS NOT NULL`).join(",")});`)) as Record<string, boolean>;
+    const result: Record<string, { present: boolean; count: number | null }> = {};
+    for (const table of tables) {
+      const present = presence[table] === true;
+      result[table] = { present, count: present ? Number(JSON.parse(await this.query(`SELECT count(*) FROM public.${table};`))) : null };
+    }
+    return result;
+  }
   async migrate(): Promise<void> {
     await super.migrate();
     const source = await readFile(join(__dirname, "..", "migrations", "002_neon_lessons.sql"), "utf8");

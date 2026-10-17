@@ -25,6 +25,17 @@ test("Windows Codex launcher finds the npm CLI when no executable is on PATH", a
   }
 });
 
+test("IMP-TASK-001 preflight only reports a launchable provider on POSIX", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "orch-codex-posix-"));
+  try {
+    await assert.rejects(resolveCodexLaunch(directory, "linux"), /not found on PATH/);
+    await writeFile(join(directory, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    assert.deepEqual(await resolveCodexLaunch(directory, "linux"), { command: "codex", argsPrefix: [] });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Codex JSONL progress, final response, and usage are captured", async () => {
   const events: string[] = [];
   const script = [

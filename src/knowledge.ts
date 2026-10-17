@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { renameWithRetry } from "./rename-with-retry";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { AttemptRecord, TaskSpec, TaskType } from "./types";
@@ -230,7 +231,7 @@ export class LocalKnowledgeStorage implements KnowledgeStorage {
       const handle = await open(temporary, "wx");
       try { await handle.writeFile(`${JSON.stringify(file, null, 2)}\n`, "utf8"); await handle.sync(); }
       finally { await handle.close(); }
-      await rename(temporary, target);
+      await renameWithRetry(temporary, target);
     } finally { await rm(temporary, { force: true }); }
   }
 
